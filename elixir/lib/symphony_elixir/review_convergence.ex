@@ -6,27 +6,36 @@ defmodule SymphonyElixir.ReviewConvergence do
   terminal tracker transition.
   """
 
-  alias SymphonyElixir.{FindingRouter, ScopeContract}
+  alias SymphonyElixir.{FindingRouter, ReviewFindingCluster, ScopeContract}
 
   @type decision ::
           {:converged, map()}
           | {:request_review, map()}
           | {:rework, map()}
           | {:hold, map()}
+          | {:convergence_hold, map()}
           | {:wait, map()}
           | {:escalate, map()}
 
   @spec evaluate(map(), non_neg_integer(), pos_integer()) :: decision()
   def evaluate(snapshot, fix_rounds, max_fix_rounds)
       when is_map(snapshot) and is_integer(fix_rounds) and is_integer(max_fix_rounds) do
+    evaluate(snapshot, empty_history(fix_rounds), max_fix_rounds)
+  end
+
+  @spec evaluate(map(), map(), pos_integer()) :: decision()
+  def evaluate(snapshot, history, max_fix_rounds)
+      when is_map(snapshot) and is_map(history) and is_integer(max_fix_rounds) do
+    history = normalize_history(history)
     actionable = Enum.filter(snapshot[:threads] || [], &actionable_thread?/1)
     {same_pr_findings, held_findings} = route_actionable(snapshot, actionable)
-    gate_evidence = evidence(snapshot, actionable, same_pr_findings, held_findings)
+    gate_evidence = evidence(snapshot, actionable, same_pr_findings, held_findings, history)
 
-    with :continue <- waiting_gate(snapshot, gate_evidence),
-         :continue <- current_head_gate(snapshot, gate_evidence),
+    with :continue <- current_head_gate(snapshot, gate_evidence),
+         :continue <- history_gate(snapshot, history, gate_evidence),
+         :continue <- waiting_gate(snapshot, gate_evidence),
          :continue <- base_gate(snapshot, gate_evidence),
-         :continue <- actionable_gate(actionable, gate_evidence, fix_rounds, max_fix_rounds),
+         :continue <- actionable_gate(actionable, gate_evidence, history, max_fix_rounds),
          :continue <- review_gate(snapshot, gate_evidence),
          :continue <- checks_gate(snapshot, gate_evidence) do
       {:converged, gate_evidence}
@@ -67,20 +76,96 @@ defmodule SymphonyElixir.ReviewConvergence do
     end
   end
 
-  defp actionable_gate([], _evidence, _fix_rounds, _max_fix_rounds), do: :continue
+  defp history_gate(snapshot, history, evidence) do
+    persisted_hold = history.holds_by_head[snapshot[:current_head_sha]]
 
-  defp actionable_gate(_actionable, evidence, fix_rounds, max_fix_rounds) do
     cond do
-      evidence.same_pr_findings == [] ->
-        {:hold, Map.put(evidence, :reason, :no_verified_same_pr_findings)}
+      not is_nil(history.ledger_error) ->
+        convergence_hold(evidence, :invalid_ledger, [], %{ledger_error: history.ledger_error})
 
-      fix_rounds >= max_fix_rounds ->
-        {:escalate, Map.put(evidence, :reason, :review_not_converging)}
+      history.legacy_rework_count > 0 ->
+        convergence_hold(evidence, :legacy_rework_without_manifest, [], %{
+          legacy_rework_count: history.legacy_rework_count
+        })
+
+      not is_nil(persisted_hold) ->
+        {:convergence_hold,
+         evidence
+         |> Map.put(:reason, :persisted_convergence_hold)
+         |> Map.put(:cluster_ids, persisted_hold.cluster_ids)
+         |> Map.put(:persisted_hold, persisted_hold)}
 
       true ->
-        {:rework, evidence}
+        :continue
     end
   end
+
+  defp actionable_gate([], _evidence, _history, _max_fix_rounds), do: :continue
+
+  defp actionable_gate(_actionable, %{same_pr_findings: []} = evidence, _history, _max_fix_rounds) do
+    {:hold, Map.put(evidence, :reason, :no_verified_same_pr_findings)}
+  end
+
+  defp actionable_gate(_actionable, evidence, history, max_fix_rounds) do
+    case ReviewFindingCluster.cluster(evidence.same_pr_findings) do
+      {:ok, clusters} ->
+        cluster_ids = Enum.map(clusters, & &1.cluster_id)
+        completed_ids = completed_cluster_ids(history, evidence.current_head_sha)
+        repeated_ids = cluster_ids |> MapSet.new() |> MapSet.intersection(completed_ids) |> MapSet.to_list() |> Enum.sort()
+
+        clustered_evidence =
+          evidence
+          |> Map.put(:clusters, clusters)
+          |> Map.put(:cluster_ids, cluster_ids)
+          |> Map.put(:next_round, history.rework_count + 1)
+
+        cond do
+          repeated_ids != [] ->
+            convergence_hold(clustered_evidence, :repeated_cluster, cluster_ids, %{
+              repeated_cluster_ids: repeated_ids
+            })
+
+          history.rework_count >= max_fix_rounds ->
+            convergence_hold(clustered_evidence, :fix_round_budget_exhausted, cluster_ids, %{
+              fix_rounds: history.rework_count,
+              max_fix_rounds: max_fix_rounds
+            })
+
+          true ->
+            {:rework, clustered_evidence}
+        end
+
+      {:error, reason} ->
+        convergence_hold(evidence, :unclusterable_evidence, [], %{cluster_error: reason})
+    end
+  end
+
+  defp convergence_hold(evidence, reason, cluster_ids, extra) do
+    {:convergence_hold,
+     evidence
+     |> Map.put(:reason, reason)
+     |> Map.put(:cluster_ids, Enum.sort(cluster_ids))
+     |> Map.merge(extra)}
+  end
+
+  defp completed_cluster_ids(history, head_sha) do
+    history.completed_cluster_ids_by_head
+    |> Map.get(head_sha, MapSet.new())
+    |> to_map_set()
+    |> then(fn completed ->
+      case history.last_completed_rework do
+        %{head_sha: ^head_sha, cluster_ids: cluster_ids} ->
+          MapSet.union(completed, MapSet.new(cluster_ids))
+
+        _other ->
+          completed
+      end
+    end)
+  end
+
+  defp to_map_set(%MapSet{} = values), do: values
+  defp to_map_set(values) when is_list(values), do: MapSet.new(values)
+  defp to_map_set(_values), do: MapSet.new()
 
   defp review_gate(snapshot, evidence) do
     if snapshot[:reviewed_head_sha] == snapshot[:current_head_sha] and
@@ -142,7 +227,7 @@ defmodule SymphonyElixir.ReviewConvergence do
     }
   end
 
-  defp evidence(snapshot, actionable, same_pr_findings, held_findings) do
+  defp evidence(snapshot, actionable, same_pr_findings, held_findings, history) do
     %{
       current_head_sha: snapshot[:current_head_sha],
       reviewed_head_sha: snapshot[:reviewed_head_sha],
@@ -152,7 +237,23 @@ defmodule SymphonyElixir.ReviewConvergence do
       required_checks: snapshot[:required_checks] || [],
       actionable_threads: actionable,
       same_pr_findings: same_pr_findings,
-      held_findings: held_findings
+      held_findings: held_findings,
+      convergence_history: history
     }
+  end
+
+  defp empty_history(rework_count) do
+    %{
+      rework_count: rework_count,
+      legacy_rework_count: 0,
+      last_completed_rework: nil,
+      completed_cluster_ids_by_head: %{},
+      holds_by_head: %{},
+      ledger_error: nil
+    }
+  end
+
+  defp normalize_history(history) do
+    Map.merge(empty_history(0), history)
   end
 end

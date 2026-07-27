@@ -456,15 +456,28 @@ and rework dedup use sorted `{thread_id, finding_comment_id, route, evidence_cod
 mutable prose. The retry limit applies only to same-PR transitions. Waiting for staging,
 permissions, or human product/safety decisions keeps the issue In Review and pauses retries.
 Technical convergence never authorizes merge, deployment, production changes, permission changes,
-or Done. This v1 does not add readiness evaluation, finding clustering/budgets, ruleset or merge
-authorization, or metrics.
+or Done.
+
+For convergence budgeting, the verified PR2 `same_pr_findings` records are the only clustering
+source. Canonical cluster IDs use exactly a typed acceptance-criterion reference, exact invariant,
+or verified current-PR-diff path; prose, priority, URLs, display filenames, and regexes are ignored.
+The versioned JSON ledger records `rework_intent`, `rework_completed`, and `convergence_hold` with
+sorted cluster IDs and restores completed/pending operations and holds after restart.
+
+A repeated cluster on the same exact head holds the whole issue, even when mixed with new clusters.
+The existing `max_fix_rounds` limit, unclusterable evidence, malformed/contradictory ledger history,
+or legacy rework without a typed manifest also creates Convergence Hold. One deduplicated team human
+decision is left while the issue stays In Review; Symphony does not update issue state or request a
+review. Hold-only PR2 routes consume no budget. This extension adds no new config, readiness logic,
+ruleset/merge authority, cross-PR clustering, automatic human override, or metrics.
 
 The state move is a recoverable transition, not two best-effort writes. Review Monitor first
 persists a stable operation intent in Linear, then moves the issue, then persists a completion
 marker. It resumes incomplete operations while the issue is in either In Review or In Progress,
 re-reads durable history after restart, and counts exactly one fix round only after the target state
-is observed and completion is durable. Unknown responses, malformed history, or conflicting
-evidence fail closed and never consume a round.
+is observed and the matching typed cluster manifest is durably completed. Crash recovery reuses the
+same operation ID and cluster IDs. Unknown responses, malformed history, or conflicting evidence
+fail closed and never consume a round.
 
 Before returning the issue to In Review, read:
 

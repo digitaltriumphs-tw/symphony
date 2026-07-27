@@ -54,7 +54,16 @@ an issue to Done.
 Rework uses Linear comment history as a scoped durable transition log: an operation intent is
 persisted before the state change, each step is retry-safe, and an incomplete operation is resumed
 even after the issue has entered In Progress or the runtime has restarted. A fix round is counted
-only after the target state is observed and the completion marker is durable.
+only after the target state is observed and the typed completion marker is durable. Verified
+same-PR findings are clustered only by typed Scope Contract AC/invariant references or exact
+current-PR-diff paths. The versioned JSON ledger restores cluster manifests, completed rounds,
+holds by head, and pending operations after restart.
+
+If a current cluster repeats on the same exact head, the existing `max_fix_rounds` budget is
+exhausted, evidence cannot be clustered, ledger history is malformed/contradictory, or legacy
+rework lacks a typed manifest, the whole issue enters Convergence Hold. Mixed repeated/new clusters
+also hold as one unit. The issue remains In Review with one deduplicated team human decision; no
+state update or rereview is issued, and hold-only routed findings consume no round.
 Each decision publishes the fixed GitHub commit status context `Review Convergence Gate`. Configure
 that context as required only after the runtime change is deployed and live-smoked; keep existing
 human approval protection until then.

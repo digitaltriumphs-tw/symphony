@@ -378,8 +378,28 @@ routes remain In Review. Hold-only findings MUST NOT request another review, cha
 or consume a fix round. For mixed findings, held evidence MUST be persisted separately before the
 verified same-PR transition. Rework and hold deduplication MUST use the sorted stable identity tuple
 `{thread_id, finding_comment_id, route, evidence_code}`, never mutable prose. The retry limit applies
-only to verified same-PR transitions. This v1 does not add readiness evaluation, finding clustering
-or budgets, ruleset or merge authorization, or metrics.
+only to verified same-PR transitions.
+
+Verified `same_pr_findings` records are the sole clustering authority. A versioned canonical cluster
+ID MUST be the SHA-256 identity of exactly one typed key: a Scope Contract acceptance-criterion ID,
+an exact Scope Contract invariant, or an exact verified current-PR-diff path. Finding prose,
+priority, URL, display filename, and regex inference MUST NOT influence cluster identity.
+
+Durable rework and Convergence Hold history MUST use one versioned JSON ledger sentinel with exact
+schemas for `rework_intent`, `rework_completed`, and `convergence_hold`. Cluster ID lists MUST be
+sorted canonically. Unknown fields, duplicate JSON keys, malformed or contradictory events, and a
+legacy rework count without a typed cluster manifest MUST fail closed to a whole-issue Convergence
+Hold. History MUST restore completed rounds, the last completed head and cluster IDs, holds by head,
+and pending transition manifests. A pending transition MUST resume with the same operation and
+cluster IDs after restart.
+
+Any current cluster overlap with a completed round for the same exact head, including a mixed set of
+repeated and new clusters, MUST hold the whole issue. Exhausting the existing `max_fix_rounds` budget
+or receiving unclusterable evidence has the same result. Convergence Hold remains In Review, emits
+one deduplicated team human decision, and MUST NOT update tracker state or request another review.
+Only a successfully completed typed same-PR transition consumes one round. This extension does not
+add readiness evaluation, new configuration, ruleset or merge authorization, cross-PR clustering,
+automatic human override, or metrics.
 
 Note:
 

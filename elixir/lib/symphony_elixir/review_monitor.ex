@@ -3,7 +3,7 @@ defmodule SymphonyElixir.ReviewMonitor do
 
   require Logger
 
-  alias SymphonyElixir.{Config, GitHubReviewClient, ReviewConvergence, Tracker}
+  alias SymphonyElixir.{Config, GitHubReviewClient, ReviewConvergence, ReviewConvergenceLedger, Tracker}
   alias SymphonyElixir.Linear.Issue
 
   @type state :: %{optional(String.t()) => map()}
@@ -56,15 +56,23 @@ defmodule SymphonyElixir.ReviewMonitor do
 
     case tracker.review_history(issue.id) do
       {:ok, history} ->
+        history = normalize_history(history)
+        fix_rounds = max(entry.fix_rounds, history.rework_count)
+        convergence_history = Map.put(history, :rework_count, fix_rounds)
+
         entry = %{
           entry
           | dedup: MapSet.union(entry.dedup, history.dedup),
-            fix_rounds: max(entry.fix_rounds, history.rework_count),
+            fix_rounds: fix_rounds,
             head_sha: entry.head_sha || history[:last_head_sha]
         }
 
-        pending_transitions = history[:pending_transitions] || %{}
-        entry = Map.put(entry, :pending_transitions, pending_transitions)
+        pending_transitions = history.pending_transitions
+
+        entry =
+          entry
+          |> Map.put(:pending_transitions, pending_transitions)
+          |> Map.put(:convergence_history, convergence_history)
 
         cond do
           map_size(pending_transitions) > 0 ->
@@ -136,7 +144,8 @@ defmodule SymphonyElixir.ReviewMonitor do
     with branch when is_binary(branch) and branch != "" <- issue.branch_name,
          {:ok, snapshot} <- review_client.snapshot(settings.repository, branch) do
       entry = invalidate_old_head(entry, snapshot.current_head_sha)
-      decision = ReviewConvergence.evaluate(snapshot, entry.fix_rounds, settings.max_fix_rounds)
+      history = entry[:convergence_history] || normalize_history(%{rework_count: entry.fix_rounds})
+      decision = ReviewConvergence.evaluate(snapshot, history, settings.max_fix_rounds)
       {updated_entry, _outcome} = apply_decision(decision, issue, entry, settings, review_client, tracker, snapshot)
       Map.put(state, issue.id, updated_entry)
     else
@@ -189,10 +198,8 @@ defmodule SymphonyElixir.ReviewMonitor do
   end
 
   defp apply_decision({:rework, evidence}, issue, entry, settings, review_client, tracker, snapshot) do
-    findings = evidence.same_pr_findings
     held_findings = evidence.held_findings
-    fingerprint = finding_fingerprint(findings)
-    key = ReviewConvergence.dedup_key(:rework, issue.id, snapshot.current_head_sha, fingerprint)
+    key = ReviewConvergence.dedup_key(:rework, issue.id, snapshot.current_head_sha, evidence.cluster_ids)
 
     case ensure_published_status(
            entry,
@@ -205,7 +212,7 @@ defmodule SymphonyElixir.ReviewMonitor do
       {entry, :ok} ->
         case persist_held_findings(issue, entry, tracker, snapshot, held_findings) do
           {entry, held_result} when held_result in [:ok, :deduplicated] ->
-            apply_rework(issue, entry, settings, tracker, snapshot, findings, fingerprint, key)
+            apply_rework(issue, entry, settings, tracker, snapshot, evidence, key)
 
           {entry, {:error, reason}} ->
             {entry, {:error, reason}}
@@ -234,6 +241,34 @@ defmodule SymphonyElixir.ReviewMonitor do
       {entry, {:error, reason}} ->
         {entry, {:error, reason}}
     end
+  end
+
+  defp apply_decision(
+         {:convergence_hold, evidence},
+         issue,
+         entry,
+         settings,
+         review_client,
+         tracker,
+         snapshot
+       ) do
+    case ensure_published_status(
+           entry,
+           review_client,
+           settings.repository,
+           snapshot,
+           :failure,
+           "Review convergence is held for one team human decision"
+         ) do
+      {entry, :ok} ->
+        apply_convergence_hold(issue, entry, settings, tracker, snapshot, evidence)
+
+      {entry, {:error, reason}} ->
+        {entry, {:error, reason}}
+    end
+    |> then(fn {updated, result} ->
+      {%{updated | waiting: result in [:ok, :deduplicated]}, result}
+    end)
   end
 
   defp apply_decision({:wait, evidence}, issue, entry, settings, review_client, tracker, snapshot) do
@@ -314,6 +349,36 @@ defmodule SymphonyElixir.ReviewMonitor do
     end
   end
 
+  defp apply_convergence_hold(issue, entry, settings, tracker, snapshot, evidence) do
+    case evidence[:persisted_hold] do
+      %{hold_id: hold_id} ->
+        {%{entry | dedup: MapSet.put(entry.dedup, hold_id)}, :deduplicated}
+
+      _new_hold ->
+        cluster_ids = Enum.sort(evidence[:cluster_ids] || [])
+        subject = {evidence.reason, cluster_ids}
+        hold_id = ReviewConvergence.dedup_key(:convergence_hold, issue.id, snapshot.current_head_sha, subject)
+
+        event = %{
+          kind: :convergence_hold,
+          hold_id: hold_id,
+          head_sha: snapshot.current_head_sha,
+          reason: evidence.reason,
+          cluster_ids: cluster_ids
+        }
+
+        dedup_action(entry, hold_id, fn ->
+          persist_convergence_hold_comment(issue, settings, tracker, snapshot, evidence, event)
+        end)
+    end
+  end
+
+  defp persist_convergence_hold_comment(issue, settings, tracker, snapshot, evidence, event) do
+    with {:ok, comment} <- convergence_hold_comment(settings, snapshot, evidence, event) do
+      tracker.create_comment(issue.id, comment)
+    end
+  end
+
   defp ensure_review_requested(review_client, repository, snapshot, key) do
     case review_client.review_request_exists?(repository, snapshot.pull_request_number, key) do
       {:ok, true} ->
@@ -327,14 +392,17 @@ defmodule SymphonyElixir.ReviewMonitor do
     end
   end
 
-  defp apply_rework(issue, entry, settings, tracker, snapshot, findings, fingerprint, key) do
+  defp apply_rework(issue, entry, settings, tracker, snapshot, evidence, key) do
+    findings = evidence.same_pr_findings
+    cluster_ids = evidence.cluster_ids
+
     {updated, comment_result} =
       dedup_action(entry, key, fn ->
         tracker.create_comment(issue.id, rework_comment(snapshot, findings, key))
       end)
 
     transition_key =
-      ReviewConvergence.dedup_key(:state_transition, issue.id, snapshot.current_head_sha, fingerprint)
+      ReviewConvergence.dedup_key(:state_transition, issue.id, snapshot.current_head_sha, cluster_ids)
 
     {updated, result, moved?} =
       cond do
@@ -345,33 +413,52 @@ defmodule SymphonyElixir.ReviewMonitor do
           {updated, :deduplicated, false}
 
         true ->
-          transition_to_rework(issue, updated, settings, tracker, snapshot, transition_key)
+          transition_to_rework(
+            issue,
+            updated,
+            settings,
+            tracker,
+            snapshot,
+            transition_key,
+            evidence.next_round,
+            cluster_ids
+          )
       end
 
     rounds = if(moved?, do: entry.fix_rounds + 1, else: entry.fix_rounds)
-    {%{updated | fix_rounds: rounds, last_finding_fingerprint: fingerprint}, result}
+    {%{updated | fix_rounds: rounds, last_finding_fingerprint: cluster_ids}, result}
   end
 
-  defp transition_to_rework(issue, entry, settings, tracker, snapshot, transition_key) do
+  defp transition_to_rework(
+         issue,
+         entry,
+         settings,
+         tracker,
+         snapshot,
+         transition_key,
+         next_round,
+         cluster_ids
+       ) do
     intent_key = "transition-intent:#{transition_key}"
+
+    intent = %{
+      kind: :rework_intent,
+      operation_id: transition_key,
+      round: next_round,
+      head_sha: snapshot.current_head_sha,
+      target_state: settings.in_progress_state,
+      cluster_ids: cluster_ids
+    }
 
     {entry, intent_result} =
       dedup_action(entry, intent_key, fn ->
-        tracker.create_comment(
-          issue.id,
-          transition_intent_comment(snapshot, settings.in_progress_state, transition_key, intent_key)
-        )
+        with {:ok, comment} <- transition_intent_comment(intent, intent_key) do
+          tracker.create_comment(issue.id, comment)
+        end
       end)
 
     if intent_result in [:ok, :deduplicated] do
-      move_and_complete_transition(
-        issue,
-        entry,
-        tracker,
-        snapshot,
-        transition_key,
-        settings.in_progress_state
-      )
+      move_and_complete_transition(issue, entry, tracker, intent)
     else
       {entry, intent_result, false}
     end
@@ -399,20 +486,23 @@ defmodule SymphonyElixir.ReviewMonitor do
   end
 
   defp recover_pending_transition(issue, entry, settings, tracker, operation_id, intent) do
-    snapshot = %{current_head_sha: intent.head_sha}
-    target_state = intent.target_state || settings.in_progress_state
+    intent =
+      intent
+      |> Map.put_new(:kind, :rework_intent)
+      |> Map.put_new(:operation_id, operation_id)
+      |> Map.put_new(:target_state, settings.in_progress_state)
 
-    if issue.state == target_state do
-      complete_transition(issue, entry, tracker, snapshot, operation_id)
+    if issue.state == intent.target_state do
+      complete_transition(issue, entry, tracker, intent)
     else
-      move_and_complete_transition(issue, entry, tracker, snapshot, operation_id, target_state)
+      move_and_complete_transition(issue, entry, tracker, intent)
     end
   end
 
-  defp move_and_complete_transition(issue, entry, tracker, snapshot, operation_id, target_state) do
-    with :ok <- tracker.update_issue_state(issue.id, target_state),
-         :ok <- verify_issue_state(tracker, issue.id, target_state) do
-      complete_transition(issue, entry, tracker, snapshot, operation_id)
+  defp move_and_complete_transition(issue, entry, tracker, intent) do
+    with :ok <- tracker.update_issue_state(issue.id, intent.target_state),
+         :ok <- verify_issue_state(tracker, issue.id, intent.target_state) do
+      complete_transition(issue, entry, tracker, intent)
     else
       {:error, reason} -> {entry, {:error, reason}, false}
     end
@@ -426,10 +516,14 @@ defmodule SymphonyElixir.ReviewMonitor do
     end
   end
 
-  defp complete_transition(issue, entry, tracker, snapshot, operation_id) do
+  defp complete_transition(issue, entry, tracker, intent) do
+    operation_id = intent.operation_id
+
     {persisted, result} =
       dedup_action(entry, operation_id, fn ->
-        tracker.create_comment(issue.id, state_transition_comment(snapshot, operation_id))
+        with {:ok, comment} <- state_transition_comment(intent) do
+          tracker.create_comment(issue.id, comment)
+        end
       end)
 
     # A deduplicated completion is already represented by this entry's durable
@@ -473,6 +567,23 @@ defmodule SymphonyElixir.ReviewMonitor do
       end
 
     Map.put(state, issue.id, %{updated | waiting: true})
+  end
+
+  defp normalize_history(history) do
+    Map.merge(
+      %{
+        dedup: MapSet.new(),
+        rework_count: 0,
+        legacy_rework_count: 0,
+        pending_transitions: %{},
+        last_completed_rework: nil,
+        completed_cluster_ids_by_head: %{},
+        holds_by_head: %{},
+        ledger_error: nil,
+        last_head_sha: nil
+      },
+      history
+    )
   end
 
   defp finding_fingerprint(findings) do
@@ -565,29 +676,66 @@ defmodule SymphonyElixir.ReviewMonitor do
     "thread #{finding.thread_id || "unknown"}, comment #{finding.finding_comment_id || "unknown"}"
   end
 
-  defp state_transition_comment(snapshot, key) do
-    """
-    Review Convergence Gate returned this issue to In Progress for latest-head repair.
+  defp state_transition_comment(intent) do
+    completed = %{intent | kind: :rework_completed}
 
-    - currentHeadSha: `#{snapshot.current_head_sha}`
-    - transition-operation: `completed`
-    - transition-operation-id: `#{key}`
-    - dedup-key: `#{key}`
-    """
+    with {:ok, ledger_block} <- ReviewConvergenceLedger.encode(completed) do
+      {:ok,
+       """
+       Review Convergence Gate returned this issue to In Progress for latest-head repair.
+
+       - currentHeadSha: `#{intent.head_sha}`
+       - transition-operation: `completed`
+       - transition-operation-id: `#{intent.operation_id}`
+       - cluster-ids: #{Enum.join(intent.cluster_ids, ", ")}
+       - dedup-key: `#{intent.operation_id}`
+
+       #{ledger_block}
+       """}
+    end
   end
 
-  defp transition_intent_comment(snapshot, target_state, operation_id, key) do
-    """
-    Review Convergence Gate recorded a durable rework transition intent.
+  defp transition_intent_comment(intent, key) do
+    with {:ok, ledger_block} <- ReviewConvergenceLedger.encode(intent) do
+      {:ok,
+       """
+       Review Convergence Gate recorded a durable rework transition intent.
 
-    - currentHeadSha: `#{snapshot.current_head_sha}`
-    - target-state: `#{target_state}`
-    - transition-operation: `intent`
-    - transition-operation-id: `#{operation_id}`
-    - dedup-key: `#{key}`
+       - currentHeadSha: `#{intent.head_sha}`
+       - target-state: `#{intent.target_state}`
+       - transition-operation: `intent`
+       - transition-operation-id: `#{intent.operation_id}`
+       - cluster-ids: #{Enum.join(intent.cluster_ids, ", ")}
+       - dedup-key: `#{key}`
 
-    This operation is safe to resume after timeout or process restart; completion is recorded separately.
-    """
+       This operation is safe to resume after timeout or process restart; completion is recorded separately.
+
+       #{ledger_block}
+       """}
+    end
+  end
+
+  defp convergence_hold_comment(settings, snapshot, evidence, event) do
+    owner = settings.human_owner || "team owner"
+
+    with {:ok, ledger_block} <- ReviewConvergenceLedger.encode(event) do
+      {:ok,
+       """
+       Review Convergence Gate placed this whole issue in Convergence Hold.
+
+       - Decision: `#{evidence.reason}`
+       - Team human owner: #{owner}
+       - PR/head: ##{snapshot.pull_request_number || "unknown"} / `#{snapshot.current_head_sha}`
+       - cluster-ids: #{Enum.join(event.cluster_ids, ", ")}
+       - Impact/risk: automated repair and rereview are paused; technical convergence is not claimed.
+       - Smallest next step: the team human owner decides whether to revise scope/implementation or accept this head.
+
+       The issue remains In Review. No state move, rereview, merge, deployment, production, permission, or secret action is authorized.
+       dedup-key: `#{event.hold_id}`
+
+       #{ledger_block}
+       """}
+    end
   end
 
   defp human_comment(settings, snapshot, reason, key) do

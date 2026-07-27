@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Linear.Adapter do
   @behaviour SymphonyElixir.Tracker
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.ReviewConvergenceLedger
 
   @review_history_query """
   query SymphonyReviewHistory($issueId: String!, $first: Int!, $after: String) {
@@ -64,10 +65,8 @@ defmodule SymphonyElixir.Linear.Adapter do
   def review_history(issue_id) when is_binary(issue_id) do
     fetch_review_history(issue_id, nil, %{
       dedup: MapSet.new(),
-      rework: MapSet.new(),
-      transition_intents: %{},
-      completed_transitions: %{},
-      invalid_transition: false,
+      legacy_rework: MapSet.new(),
+      comment_bodies: [],
       last_head_sha: nil
     })
   end
@@ -112,7 +111,7 @@ defmodule SymphonyElixir.Linear.Adapter do
   defp collect_history(%{"body" => body}, history) when is_binary(body) do
     history
     |> collect_dedup(body)
-    |> collect_transition(body)
+    |> Map.update!(:comment_bodies, &[body | &1])
     |> collect_head_sha(body)
   end
 
@@ -121,12 +120,12 @@ defmodule SymphonyElixir.Linear.Adapter do
   defp collect_dedup(history, body) do
     case Regex.run(~r/dedup-key: `([^`]+)`/, body, capture: :all_but_first) do
       [key] ->
-        rework =
-          if String.contains?(body, "Review Convergence Gate returned this issue to In Progress"),
-            do: MapSet.put(history.rework, key),
-            else: history.rework
+        legacy_rework =
+          if legacy_rework_comment?(body),
+            do: MapSet.put(history.legacy_rework, key),
+            else: history.legacy_rework
 
-        %{history | dedup: MapSet.put(history.dedup, key), rework: rework}
+        %{history | dedup: MapSet.put(history.dedup, key), legacy_rework: legacy_rework}
 
       _ ->
         history
@@ -151,96 +150,33 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
-  defp collect_transition(history, body) do
-    operation_id = capture(body, ~r/transition-operation-id: `([^`]+)`/)
-
-    cond do
-      is_nil(operation_id) ->
-        history
-
-      String.contains?(body, "transition-operation: `intent`") ->
-        collect_transition_intent(history, body, operation_id)
-
-      String.contains?(body, "transition-operation: `completed`") ->
-        collect_transition_completion(history, body, operation_id)
-
-      true ->
-        history
-    end
-  end
-
-  defp collect_transition_intent(history, body, operation_id) do
-    intent = %{
-      operation_id: operation_id,
-      head_sha: capture(body, ~r/currentHeadSha: `([0-9a-f]{40})`/i),
-      target_state: capture(body, ~r/target-state: `([^`]+)`/)
-    }
-
-    existing = history.transition_intents[operation_id]
-
-    invalid? =
-      is_nil(intent.head_sha) or is_nil(intent.target_state) or
-        (not is_nil(existing) and existing != intent)
-
-    %{
-      history
-      | transition_intents: Map.put(history.transition_intents, operation_id, intent),
-        invalid_transition: history.invalid_transition or invalid?
-    }
-  end
-
-  defp collect_transition_completion(history, body, operation_id) do
-    completion = %{
-      operation_id: operation_id,
-      head_sha: capture(body, ~r/currentHeadSha: `([0-9a-f]{40})`/i),
-      dedup_key: capture(body, ~r/dedup-key: `([^`]+)`/)
-    }
-
-    existing = history.completed_transitions[operation_id]
-
-    invalid? =
-      is_nil(completion.head_sha) or completion.dedup_key != operation_id or
-        (not is_nil(existing) and existing != completion)
-
-    %{
-      history
-      | completed_transitions: Map.put(history.completed_transitions, operation_id, completion),
-        invalid_transition: history.invalid_transition or invalid?
-    }
-  end
-
-  defp capture(body, pattern) do
-    case Regex.run(pattern, body, capture: :all_but_first) do
-      [value] -> value
-      _ -> nil
-    end
-  end
-
   defp finalize_review_history(history) do
-    completed_ids = Map.keys(history.completed_transitions)
+    base = %{
+      dedup: history.dedup,
+      legacy_rework_count: MapSet.size(history.legacy_rework),
+      last_head_sha: history.last_head_sha
+    }
 
-    completed_without_intent =
-      MapSet.difference(MapSet.new(completed_ids), MapSet.new(Map.keys(history.transition_intents)))
+    case ReviewConvergenceLedger.history(Enum.reverse(history.comment_bodies)) do
+      {:ok, ledger_history} ->
+        {:ok, Map.merge(base, Map.put(ledger_history, :ledger_error, nil))}
 
-    mismatched_completion? =
-      Enum.any?(history.completed_transitions, fn {operation_id, completion} ->
-        case history.transition_intents[operation_id] do
-          %{head_sha: head_sha} -> completion.head_sha != head_sha
-          _ -> true
-        end
-      end)
-
-    if history.invalid_transition or MapSet.size(completed_without_intent) > 0 or mismatched_completion? do
-      {:error, :invalid_review_transition_history}
-    else
-      {:ok,
-       %{
-         dedup: history.dedup,
-         rework_count: MapSet.size(history.rework),
-         pending_transitions: Map.drop(history.transition_intents, completed_ids),
-         last_head_sha: history.last_head_sha
-       }}
+      {:error, reason} ->
+        {:ok,
+         Map.merge(base, %{
+           rework_count: 0,
+           pending_transitions: %{},
+           last_completed_rework: nil,
+           completed_cluster_ids_by_head: %{},
+           holds_by_head: %{},
+           ledger_error: reason
+         })}
     end
+  end
+
+  defp legacy_rework_comment?(body) do
+    String.contains?(body, "Review Convergence Gate returned this issue to In Progress") and
+      ReviewConvergenceLedger.parse_comment(body) == :none
   end
 
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}

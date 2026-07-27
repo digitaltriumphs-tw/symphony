@@ -5,8 +5,12 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   alias SymphonyElixir.GitHubReviewClient
   alias SymphonyElixir.Linear.{Adapter, Issue}
   alias SymphonyElixir.ReviewConvergence
+  alias SymphonyElixir.ReviewConvergenceLedger
   alias SymphonyElixir.ReviewMonitor
   alias SymphonyElixir.ScopeContract
+
+  @cluster_ac_1 "symphony-review-finding-cluster:v1:992112030cba4e48b120c7f3add9d5af9a895d323af521366122dc2f824bec84"
+  @cluster_current_diff "symphony-review-finding-cluster:v1:506b3e7fedceec635a36c148ae36dfa839a445ffda1a32ecc3cc4f86a81189ba"
 
   defmodule ReviewClient do
     @spec snapshot(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
@@ -919,7 +923,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     refute_receive {:status, _, _, _, _}
   end
 
-  test "Linear rework history paginates and counts stable keys once" do
+  test "Linear history paginates, deduplicates keys, and quarantines legacy rework without a typed manifest" do
     Application.put_env(:symphony_elixir, :linear_client_module, HistoryClient)
 
     Process.put(:history_responses, [
@@ -927,7 +931,13 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       history_page([rework_body("one"), rework_body("two"), converged_body(String.duplicate("b", 40))], false, nil)
     ])
 
-    assert {:ok, %{dedup: dedup, rework_count: 2, last_head_sha: last_head_sha}} =
+    assert {:ok,
+            %{
+              dedup: dedup,
+              rework_count: 0,
+              legacy_rework_count: 2,
+              last_head_sha: last_head_sha
+            }} =
              Adapter.review_history("issue-160")
 
     assert dedup == MapSet.new(["one", "two", "converged"])
@@ -936,42 +946,57 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert_receive {:history_page, "next"}
   end
 
-  test "Linear history exposes only incomplete durable transition intents" do
+  test "Linear history restores typed completed manifests and only incomplete durable intents" do
     Application.put_env(:symphony_elixir, :linear_client_module, HistoryClient)
     head = String.duplicate("c", 40)
 
     Process.put(:history_responses, [
       history_page(
         [
-          transition_intent_body("pending", head),
-          transition_intent_body("completed", head),
-          transition_completed_body("completed", head)
+          transition_intent_body("pending", head, 2, [@cluster_current_diff]),
+          transition_intent_body("completed", head, 1, [@cluster_ac_1]),
+          transition_completed_body("completed", head, 1, [@cluster_ac_1])
         ],
         false,
         nil
       )
     ])
 
-    assert {:ok, %{pending_transitions: pending, rework_count: 1}} =
+    assert {:ok,
+            %{
+              pending_transitions: pending,
+              rework_count: 1,
+              last_completed_rework: completed,
+              completed_cluster_ids_by_head: completed_by_head
+            }} =
              Adapter.review_history("issue-160")
 
     assert pending == %{
              "pending" => %{
+               kind: :rework_intent,
                operation_id: "pending",
+               round: 2,
                head_sha: head,
-               target_state: "In Progress"
+               target_state: "In Progress",
+               cluster_ids: [@cluster_current_diff]
              }
            }
+
+    assert completed == completed_rework("completed", 1, head, [@cluster_ac_1])
+    assert completed_by_head == %{head => MapSet.new([@cluster_ac_1])}
   end
 
-  test "malformed or contradictory transition history fails closed" do
+  test "malformed ledger history is returned as typed hold evidence instead of being interpreted by prose" do
     Application.put_env(:symphony_elixir, :linear_client_module, HistoryClient)
 
     Process.put(:history_responses, [
       history_page(
         [
           %{
-            "body" => "transition-operation: `intent`\ntransition-operation-id: `broken`\ndedup-key: `transition-intent:broken`"
+            "body" =>
+              "transition-operation: `intent`\ntransition-operation-id: `broken`\n" <>
+                "<!-- symphony-review-convergence-ledger:v1\n{not-json}\n-->\n" <>
+                "dedup-key: `transition-intent:broken`"
           }
         ],
         false,
@@ -979,10 +1004,10 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       )
     ])
 
-    assert {:error, :invalid_review_transition_history} = Adapter.review_history("issue-160")
+    assert {:ok, %{ledger_error: :malformed_ledger_event}} = Adapter.review_history("issue-160")
   end
 
-  test "completion markers must match their durable transition intent" do
+  test "typed completion manifests must match their durable intent" do
     Application.put_env(:symphony_elixir, :linear_client_module, HistoryClient)
     intent_head = String.duplicate("d", 40)
     conflicting_head = String.duplicate("e", 40)
@@ -990,36 +1015,16 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     Process.put(:history_responses, [
       history_page(
         [
-          transition_intent_body("conflict", intent_head),
-          transition_completed_body("conflict", conflicting_head)
+          transition_intent_body("conflict", intent_head, 1, [@cluster_ac_1]),
+          transition_completed_body("conflict", conflicting_head, 1, [@cluster_ac_1])
         ],
         false,
         nil
       )
     ])
 
-    assert {:error, :invalid_review_transition_history} = Adapter.review_history("issue-160")
-
-    Process.put(:history_responses, [
-      history_page(
-        [
-          transition_intent_body("bad-dedup", intent_head),
-          %{
-            transition_completed_body("bad-dedup", intent_head)
-            | "body" =>
-                String.replace(
-                  transition_completed_body("bad-dedup", intent_head)["body"],
-                  "dedup-key: `bad-dedup`",
-                  "dedup-key: `reused-other-key`"
-                )
-          }
-        ],
-        false,
-        nil
-      )
-    ])
-
-    assert {:error, :invalid_review_transition_history} = Adapter.review_history("issue-160")
+    assert {:ok, %{ledger_error: :completion_manifest_mismatch}} =
+             Adapter.review_history("issue-160")
   end
 
   test "structured snapshot errors fail closed without crashing comment rendering" do
@@ -1230,6 +1235,87 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
            ]
   end
 
+  test "verified same-PR evidence exposes only canonical typed cluster IDs to rework" do
+    assert {:rework,
+            %{
+              cluster_ids: [@cluster_current_diff, @cluster_ac_1],
+              clusters: [
+                %{cluster_id: @cluster_current_diff, key: {:current_pr_diff, "lib/current.ex"}},
+                %{
+                  cluster_id: @cluster_ac_1,
+                  key: {:scope_reference, :acceptance_criterion, "AC-1"}
+                }
+              ]
+            }} =
+             snapshot(%{threads: [same_pr_finding(), current_diff_finding()]})
+             |> ReviewConvergence.evaluate(empty_convergence_history(), 3)
+  end
+
+  test "any exact-head cluster overlap holds the whole issue, including mixed repeated and new clusters" do
+    history =
+      empty_convergence_history(%{
+        rework_count: 1,
+        last_completed_rework: completed_rework("operation-1", 1, "head", [@cluster_ac_1]),
+        completed_cluster_ids_by_head: %{"head" => MapSet.new([@cluster_ac_1])}
+      })
+
+    assert {:convergence_hold,
+            %{
+              reason: :repeated_cluster,
+              cluster_ids: [@cluster_current_diff, @cluster_ac_1],
+              repeated_cluster_ids: [@cluster_ac_1]
+            }} =
+             snapshot(%{threads: [same_pr_finding(), current_diff_finding()]})
+             |> ReviewConvergence.evaluate(history, 3)
+  end
+
+  test "the same cluster on a new head may consume the next existing fix-round budget slot" do
+    history =
+      empty_convergence_history(%{
+        rework_count: 1,
+        last_completed_rework: completed_rework("operation-1", 1, "head", [@cluster_ac_1]),
+        completed_cluster_ids_by_head: %{"head" => MapSet.new([@cluster_ac_1])}
+      })
+
+    finding = same_pr_finding_for_head("new-head")
+
+    assert {:rework, %{cluster_ids: [@cluster_ac_1], next_round: 2}} =
+             snapshot(%{current_head_sha: "new-head", threads: [finding]})
+             |> ReviewConvergence.evaluate(history, 3)
+  end
+
+  test "exhausted typed budget, malformed ledger, legacy rounds, and persisted holds all fail closed" do
+    finding = same_pr_finding()
+
+    exhausted = empty_convergence_history(%{rework_count: 3})
+
+    assert {:convergence_hold, %{reason: :fix_round_budget_exhausted}} =
+             snapshot(%{threads: [finding]}) |> ReviewConvergence.evaluate(exhausted, 3)
+
+    invalid = empty_convergence_history(%{ledger_error: :completion_manifest_mismatch})
+
+    assert {:convergence_hold, %{reason: :invalid_ledger}} =
+             snapshot() |> ReviewConvergence.evaluate(invalid, 3)
+
+    legacy = empty_convergence_history(%{legacy_rework_count: 1})
+
+    assert {:convergence_hold, %{reason: :legacy_rework_without_manifest}} =
+             snapshot() |> ReviewConvergence.evaluate(legacy, 3)
+
+    persisted_hold = %{
+      kind: :convergence_hold,
+      hold_id: "hold-head",
+      head_sha: "head",
+      reason: :repeated_cluster,
+      cluster_ids: [@cluster_ac_1]
+    }
+
+    held = empty_convergence_history(%{holds_by_head: %{"head" => persisted_hold}})
+
+    assert {:convergence_hold, %{reason: :persisted_convergence_hold, persisted_hold: ^persisted_hold}} =
+             snapshot() |> ReviewConvergence.evaluate(held, 3)
+  end
+
   test "an invalid Scope Contract holds every actionable finding without requesting another review" do
     assert {:hold,
             %{
@@ -1278,14 +1364,83 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert body =~ "P1"
     assert_receive {:comment, "issue-160", intent_body}
     assert intent_body =~ "transition-operation: `intent`"
+    assert {:ok, intent_event} = ReviewConvergenceLedger.parse_comment(intent_body)
+    assert intent_event.kind == :rework_intent
+    assert intent_event.round == 1
+    assert intent_event.head_sha == "head"
+    assert intent_event.cluster_ids == [@cluster_ac_1]
     assert_receive {:state, "issue-160", "In Progress"}
     assert_receive {:comment, "issue-160", transition_body}
     assert transition_body =~ "returned this issue to In Progress"
     assert transition_body =~ "transition-operation: `completed`"
+    assert {:ok, completed_event} = ReviewConvergenceLedger.parse_comment(transition_body)
+    assert completed_event.kind == :rework_completed
+    assert completed_event.operation_id == intent_event.operation_id
+    assert completed_event.cluster_ids == intent_event.cluster_ids
 
     _state = ReviewMonitor.run_with(state, settings(), ReviewClient, Tracker)
     refute_receive {:comment, _, _}
     refute_receive {:state, _, _}
+  end
+
+  test "a repeated exact-head cluster writes one durable Convergence Hold and never moves state or rereviews" do
+    completed = completed_rework("operation-1", 1, "head", [@cluster_ac_1])
+
+    history =
+      empty_convergence_history(%{
+        rework_count: 1,
+        last_completed_rework: completed,
+        completed_cluster_ids_by_head: %{"head" => MapSet.new([@cluster_ac_1])}
+      })
+
+    Application.put_env(:symphony_elixir, :review_history, {:ok, history})
+    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [same_pr_finding()]})})
+
+    state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+
+    assert_receive {:status, _, "head", :failure, _}
+    assert_receive {:comment, "issue-160", hold_comment}
+    assert hold_comment =~ "Convergence Hold"
+    assert hold_comment =~ "repeated_cluster"
+    assert {:ok, hold_event} = ReviewConvergenceLedger.parse_comment(hold_comment)
+    assert hold_event.kind == :convergence_hold
+    assert hold_event.head_sha == "head"
+    assert hold_event.cluster_ids == [@cluster_ac_1]
+    refute_receive {:state, _, _}
+    refute_receive {:review_requested, _, _, _}
+    assert state["issue-160"].fix_rounds == 1
+
+    restarted_history =
+      history
+      |> Map.put(:dedup, MapSet.new([hold_event.hold_id]))
+      |> Map.put(:holds_by_head, %{"head" => hold_event})
+
+    Application.put_env(:symphony_elixir, :review_history, {:ok, restarted_history})
+
+    _restarted = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+    assert_receive {:status, _, "head", :failure, _}
+    refute_receive {:comment, _, _}
+    refute_receive {:state, _, _}
+    refute_receive {:review_requested, _, _, _}
+  end
+
+  test "malformed durable ledger creates a Convergence Hold without state or review effects" do
+    history = empty_convergence_history(%{ledger_error: :completion_manifest_mismatch})
+    Application.put_env(:symphony_elixir, :review_history, {:ok, history})
+    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot()})
+
+    _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+
+    assert_receive {:status, _, "head", :failure, _}
+    assert_receive {:comment, "issue-160", hold_comment}
+    assert hold_comment =~ "Convergence Hold"
+    assert hold_comment =~ "invalid_ledger"
+
+    assert {:ok, %{kind: :convergence_hold, reason: :invalid_ledger, cluster_ids: []}} =
+             ReviewConvergenceLedger.parse_comment(hold_comment)
+
+    refute_receive {:state, _, _}
+    refute_receive {:review_requested, _, _, _}
   end
 
   test "hold-only findings publish one stable comment and consume no repair round or rereview" do
@@ -1363,36 +1518,16 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert completed_comment =~ "transition-operation: `completed`"
 
     assert state["issue-160"].fix_rounds == 1
-    assert state["issue-160"].last_finding_fingerprint == [same_pr_identity()]
+    assert state["issue-160"].last_finding_fingerprint == [@cluster_ac_1]
 
     _state = ReviewMonitor.run_with(state, settings(), ReviewClient, Tracker)
     refute_receive {:comment, _, _}
     refute_receive {:state, _, _}
   end
 
-  test "persisted rework key prevents duplicate tracker effects after restart" do
-    finding = same_pr_finding(%{body: "P1 data loss", url: "https://example.test/thread"})
-    fingerprint = [same_pr_identity()]
-    key = ReviewConvergence.dedup_key(:rework, "issue-160", "head", fingerprint)
-    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
-
-    transition_key = ReviewConvergence.dedup_key(:state_transition, "issue-160", "head", fingerprint)
-
-    Application.put_env(
-      :symphony_elixir,
-      :review_history,
-      {:ok, %{dedup: MapSet.new([key, transition_key]), rework_count: 1}}
-    )
-
-    _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :failure, _}
-    refute_receive {:comment, _, _}
-    refute_receive {:state, _, _}
-  end
-
   test "state transition retries after the rework comment already persisted" do
     finding = same_pr_finding(%{body: "P1 state retry", url: "thread"})
-    fingerprint = [same_pr_identity()]
+    fingerprint = [@cluster_ac_1]
     key = ReviewConvergence.dedup_key(:rework, "issue-160", "head", fingerprint)
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
     Application.put_env(:symphony_elixir, :review_state_result, {:error, :linear_unavailable})
@@ -1402,16 +1537,22 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert rework_body =~ "actionable latest-head findings"
     assert_receive {:comment, "issue-160", intent_body}
     assert intent_body =~ "transition-operation: `intent`"
+    assert {:ok, first_intent} = ReviewConvergenceLedger.parse_comment(intent_body)
+    assert first_intent.cluster_ids == [@cluster_ac_1]
     assert_receive {:state, "issue-160", "In Progress"}
     assert first_state["issue-160"].fix_rounds == 0
 
-    transition_key = ReviewConvergence.dedup_key(:state_transition, "issue-160", "head", fingerprint)
+    transition_key = first_intent.operation_id
     intent_key = "transition-intent:#{transition_key}"
 
     Application.put_env(
       :symphony_elixir,
       :review_history,
-      {:ok, %{dedup: MapSet.new([key, intent_key]), rework_count: 0}}
+      {:ok,
+       empty_convergence_history(%{
+         dedup: MapSet.new([key, intent_key]),
+         pending_transitions: %{transition_key => first_intent}
+       })}
     )
 
     Application.put_env(:symphony_elixir, :review_state_result, :ok)
@@ -1420,18 +1561,27 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert_receive {:state, "issue-160", "In Progress"}
     assert_receive {:comment, "issue-160", transition_body}
     assert transition_body =~ "returned this issue to In Progress"
+    assert {:ok, resumed_completion} = ReviewConvergenceLedger.parse_comment(transition_body)
+    assert resumed_completion.operation_id == first_intent.operation_id
+    assert resumed_completion.cluster_ids == first_intent.cluster_ids
     assert second_state["issue-160"].fix_rounds == 1
 
-    Application.put_env(
-      :symphony_elixir,
-      :review_history,
-      {:ok, %{dedup: MapSet.new([key, transition_key]), rework_count: 1}}
-    )
+    Application.put_env(:symphony_elixir, :review_issues, [%{issue() | state: "In Progress"}])
+
+    Application.put_env(:symphony_elixir, :review_history, {
+      :ok,
+      empty_convergence_history(%{
+        dedup: MapSet.new([key, transition_key]),
+        rework_count: 1,
+        last_completed_rework: resumed_completion,
+        completed_cluster_ids_by_head: %{"head" => MapSet.new([@cluster_ac_1])}
+      })
+    })
 
     restarted = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
     refute_receive {:comment, _, _}
     refute_receive {:state, _, _}
-    assert restarted["issue-160"].fix_rounds == 1
+    assert restarted == %{}
   end
 
   test "state transition completion requires authoritative target-state readback" do
@@ -1465,9 +1615,12 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
          rework_count: 0,
          pending_transitions: %{
            operation_id => %{
+             kind: :rework_intent,
              operation_id: operation_id,
+             round: 1,
              head_sha: String.duplicate("a", 40),
-             target_state: "In Progress"
+             target_state: "In Progress",
+             cluster_ids: [@cluster_ac_1]
            }
          }
        }}
@@ -1478,6 +1631,10 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert_receive {:comment, "issue-160", completion}
     assert completion =~ "transition-operation: `completed`"
     assert completion =~ "transition-operation-id: `#{operation_id}`"
+
+    assert {:ok, %{kind: :rework_completed, cluster_ids: [@cluster_ac_1]}} =
+             ReviewConvergenceLedger.parse_comment(completion)
+
     refute_receive {:state, _, _}
     refute_receive {:status, _, _, _, _}
     assert state["issue-160"].fix_rounds == 1
@@ -1495,9 +1652,12 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
          rework_count: 0,
          pending_transitions: %{
            operation_id => %{
+             kind: :rework_intent,
              operation_id: operation_id,
+             round: 1,
              head_sha: String.duplicate("b", 40),
-             target_state: "In Progress"
+             target_state: "In Progress",
+             cluster_ids: [@cluster_ac_1]
            }
          }
        }}
@@ -1508,6 +1668,10 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert_receive {:state, "issue-160", "In Progress"}
     assert_receive {:comment, "issue-160", completion}
     assert completion =~ "transition-operation: `completed`"
+
+    assert {:ok, %{kind: :rework_completed, cluster_ids: [@cluster_ac_1]}} =
+             ReviewConvergenceLedger.parse_comment(completion)
+
     assert state["issue-160"].fix_rounds == 1
   end
 
@@ -1527,9 +1691,12 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
          rework_count: 1,
          pending_transitions: %{
            operation_id => %{
+             kind: :rework_intent,
              operation_id: operation_id,
+             round: 1,
              head_sha: String.duplicate("c", 40),
-             target_state: "In Progress"
+             target_state: "In Progress",
+             cluster_ids: [@cluster_ac_1]
            }
          }
        }}
@@ -1603,37 +1770,46 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     refute_receive {:comment, _, _}
   end
 
-  test "persistent actionable findings escalate instead of scheduling another repair" do
-    finding = same_pr_finding(%{priority: 3, body: "P3 recurring patch", url: "thread"})
-    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
+  test "exhausted typed fix-round budget creates a Convergence Hold instead of scheduling repair" do
+    finding = same_pr_finding_for_head("new-head")
 
-    entry = %{
-      "issue-160" => %{
-        dedup: MapSet.new(),
-        fix_rounds: 3,
-        head_sha: "head",
-        review_requested: false,
-        waiting: false,
-        last_finding_fingerprint: nil
-      }
-    }
+    Application.put_env(
+      :symphony_elixir,
+      :review_snapshot,
+      {:ok, snapshot(%{current_head_sha: "new-head", threads: [finding]})}
+    )
 
-    _state = ReviewMonitor.run_with(entry, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :failure, _}
+    Application.put_env(
+      :symphony_elixir,
+      :review_history,
+      {:ok, empty_convergence_history(%{rework_count: 3})}
+    )
+
+    _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+    assert_receive {:status, _, "new-head", :failure, _}
     assert_receive {:comment, "issue-160", body}
-    assert body =~ "review_not_converging"
+    assert body =~ "Convergence Hold"
+    assert body =~ "fix_round_budget_exhausted"
+    assert {:ok, %{kind: :convergence_hold}} = ReviewConvergenceLedger.parse_comment(body)
     refute_receive {:state, _, _}
+    refute_receive {:review_requested, _, _, _}
   end
 
-  test "persisted rework rounds survive restart and force human escalation" do
+  test "legacy rework count without typed manifests creates a Convergence Hold" do
     finding = same_pr_finding(%{priority: 2, body: "P2 recurring patch", url: "thread"})
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
-    Application.put_env(:symphony_elixir, :review_history, {:ok, %{dedup: MapSet.new(), rework_count: 3}})
+
+    Application.put_env(
+      :symphony_elixir,
+      :review_history,
+      {:ok, empty_convergence_history(%{legacy_rework_count: 3})}
+    )
 
     _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
     assert_receive {:comment, "issue-160", body}
-    assert body =~ "review_not_converging"
+    assert body =~ "legacy_rework_without_manifest"
     refute_receive {:state, _, _}
+    refute_receive {:review_requested, _, _, _}
   end
 
   test "unverifiable persisted rework history fails closed" do
@@ -1772,6 +1948,31 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     )
   end
 
+  defp same_pr_finding_for_head(head_sha) do
+    payload = put_in(same_pr_payload(), ["binding", "head_sha"], head_sha)
+    same_pr_finding(%{disposition: {:decoded, payload}, commit_sha: head_sha})
+  end
+
+  defp current_diff_finding do
+    payload = %{
+      "schema_version" => 1,
+      "kind" => "introduced_by_pr",
+      "binding" => %{
+        "base_sha" => "base",
+        "head_sha" => "head",
+        "path" => "lib/current.ex"
+      },
+      "proof" => %{"type" => "current_pr_diff"}
+    }
+
+    same_pr_finding(%{
+      path: "lib/current.ex",
+      thread_id: "thread-current-diff",
+      finding_comment_id: "comment-current-diff",
+      disposition: {:decoded, payload}
+    })
+  end
+
   defp held_finding(overrides \\ %{}) do
     Map.merge(
       %{
@@ -1790,8 +1991,32 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     )
   end
 
-  defp same_pr_identity do
-    {"thread-same", "comment-same", :same_pr, :scope_contract_reference_verified}
+  defp empty_convergence_history(overrides \\ %{}) do
+    Map.merge(
+      %{
+        dedup: MapSet.new(),
+        rework_count: 0,
+        legacy_rework_count: 0,
+        pending_transitions: %{},
+        last_completed_rework: nil,
+        completed_cluster_ids_by_head: %{},
+        holds_by_head: %{},
+        ledger_error: nil,
+        last_head_sha: nil
+      },
+      overrides
+    )
+  end
+
+  defp completed_rework(operation_id, round, head_sha, cluster_ids) do
+    %{
+      kind: :rework_completed,
+      operation_id: operation_id,
+      round: round,
+      head_sha: head_sha,
+      target_state: "In Progress",
+      cluster_ids: Enum.sort(cluster_ids)
+    }
   end
 
   defp snapshot(overrides \\ %{}) do
@@ -1818,7 +2043,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     %{"body" => "Review Convergence Gate returned this issue to In Progress for latest-head repair.\n\ndedup-key: `#{key}`"}
   end
 
-  defp transition_intent_body(operation_id, head_sha) do
+  defp transition_intent_body(operation_id, head_sha, round, cluster_ids) do
     %{
       "body" => """
       Review Convergence Gate recorded a durable rework transition intent.
@@ -1827,11 +2052,13 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       transition-operation: `intent`
       transition-operation-id: `#{operation_id}`
       dedup-key: `transition-intent:#{operation_id}`
+
+      #{ledger_block(%{"schema_version" => 1, "event" => "rework_intent", "operation_id" => operation_id, "round" => round, "head_sha" => head_sha, "target_state" => "In Progress", "cluster_ids" => Enum.sort(cluster_ids)})}
       """
     }
   end
 
-  defp transition_completed_body(operation_id, head_sha) do
+  defp transition_completed_body(operation_id, head_sha, round, cluster_ids) do
     %{
       "body" => """
       Review Convergence Gate returned this issue to In Progress for latest-head repair.
@@ -1839,8 +2066,14 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       transition-operation: `completed`
       transition-operation-id: `#{operation_id}`
       dedup-key: `#{operation_id}`
+
+      #{ledger_block(%{"schema_version" => 1, "event" => "rework_completed", "operation_id" => operation_id, "round" => round, "head_sha" => head_sha, "target_state" => "In Progress", "cluster_ids" => Enum.sort(cluster_ids)})}
       """
     }
+  end
+
+  defp ledger_block(payload) do
+    "<!-- symphony-review-convergence-ledger:v1\n#{Jason.encode!(payload)}\n-->"
   end
 
   defp converged_body(head_sha) do
