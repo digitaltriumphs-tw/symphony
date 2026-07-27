@@ -4,8 +4,7 @@ defmodule SymphonyElixir.MergeAuthorizationTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.GitHubReviewClient
   alias SymphonyElixir.Linear.{Adapter, Issue}
-  alias SymphonyElixir.MergeAuthorization
-  alias SymphonyElixir.MergeAuthorizationLedger
+  alias SymphonyElixir.{MergeAuthorization, MergeAuthorizationLedger, MergeExecutor}
   alias SymphonyElixir.ReviewMonitor
 
   @repository "aroakpm-svg/repo"
@@ -31,9 +30,13 @@ defmodule SymphonyElixir.MergeAuthorizationTest do
       :ok
     end
 
-    @spec ruleset_receipt(String.t(), String.t()) :: {:ok, map()}
+    @spec ruleset_receipt(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
     def ruleset_receipt(_repository, _base_ref) do
-      {:ok, Application.fetch_env!(:symphony_elixir, :ruleset_receipt)}
+      Application.get_env(
+        :symphony_elixir,
+        :ruleset_result,
+        {:ok, Application.fetch_env!(:symphony_elixir, :ruleset_receipt)}
+      )
     end
 
     @spec pull_request_state(String.t(), pos_integer()) :: {:ok, map()} | {:error, term()}
@@ -65,8 +68,13 @@ defmodule SymphonyElixir.MergeAuthorizationTest do
     def create_comment(issue_id, body) do
       send(Application.fetch_env!(:symphony_elixir, :merge_recipient), {:comment, issue_id, body})
 
-      if Application.get_env(:symphony_elixir, :fail_merge_completion, false) and
-           String.contains?(body, ~s("event":"merge_completed")) do
+      failed_event =
+        Application.get_env(:symphony_elixir, :fail_merge_event) ||
+          if(Application.get_env(:symphony_elixir, :fail_merge_completion, false),
+            do: :merge_completed
+          )
+
+      if is_atom(failed_event) and String.contains?(body, ~s("event":"#{failed_event}")) do
         {:error, :linear_unavailable}
       else
         :ok
@@ -91,6 +99,30 @@ defmodule SymphonyElixir.MergeAuthorizationTest do
     end
   end
 
+  defmodule SequencedReleaseLookup do
+    @moduledoc false
+    @behaviour Access
+
+    defstruct [:lookup_key, :value]
+
+    @impl Access
+    def fetch(%__MODULE__{lookup_key: key, value: value}, key) do
+      counter_key = {__MODULE__, key}
+      reads = Process.get(counter_key, 0)
+      Process.put(counter_key, reads + 1)
+
+      if reads < 2, do: {:ok, value}, else: :error
+    end
+
+    def fetch(%__MODULE__{}, _key), do: :error
+
+    @impl Access
+    def get_and_update(_lookup, _key, _function), do: raise("read-only test fixture")
+
+    @impl Access
+    def pop(_lookup, _key), do: raise("read-only test fixture")
+  end
+
   setup do
     Application.put_env(:symphony_elixir, :merge_recipient, self())
     Application.put_env(:symphony_elixir, :merge_issues, [issue()])
@@ -111,6 +143,8 @@ defmodule SymphonyElixir.MergeAuthorizationTest do
             :merge_history,
             :merge_history_page,
             :fail_merge_completion,
+            :fail_merge_event,
+            :ruleset_result,
             :linear_client_module
           ] do
         Application.delete_env(:symphony_elixir, key)
@@ -471,6 +505,399 @@ defmodule SymphonyElixir.MergeAuthorizationTest do
     assert {:ok, history} = Adapter.review_history(@issue_id)
     assert history.merge.releases[operation_id].kind == :authorization_release
     assert history.merge.intents[operation_id].kind == :merge_intent
+  end
+
+  test "ledger rejects invalid public inputs and malformed envelopes" do
+    assert {:error, :invalid_merge_event} = MergeAuthorizationLedger.encode(nil)
+    assert {:error, :invalid_merge_event} = MergeAuthorizationLedger.encode(%{})
+    assert :none = MergeAuthorizationLedger.parse_comment("ordinary comment")
+    assert {:error, :malformed_merge_event} = MergeAuthorizationLedger.parse_comment(nil)
+    assert {:error, :malformed_merge_event} = MergeAuthorizationLedger.history(:not_a_list)
+
+    assert {:error, :malformed_merge_event} =
+             MergeAuthorizationLedger.parse_comment("<!-- symphony-merge-authorization-ledger:v1\n{}")
+
+    for json <- ["not-json", "[]"] do
+      assert {:error, :malformed_merge_event} =
+               json |> raw_ledger() |> MergeAuthorizationLedger.parse_comment()
+    end
+
+    for {payload, expected} <- [
+          {%{"schema_version" => 2}, :unsupported_merge_ledger_version},
+          {%{"schema_version" => 1}, :unknown_merge_event},
+          {%{"unexpected" => true}, :malformed_merge_event}
+        ] do
+      assert {:error, ^expected} =
+               payload |> Jason.encode!() |> raw_ledger() |> MergeAuthorizationLedger.parse_comment()
+    end
+  end
+
+  test "ledger rejects duplicate JSON keys at every nesting level" do
+    duplicate_top =
+      ~s({"schema_version":1,"schema_version":1,"event":"authorization_release"})
+
+    duplicate_nested = ~s({"items":[{"key":1,"key":2}]})
+
+    for json <- [duplicate_top, duplicate_nested] do
+      assert {:error, :duplicate_json_key} =
+               json |> raw_ledger() |> MergeAuthorizationLedger.parse_comment()
+    end
+
+    assert {:error, :malformed_merge_event} =
+             ~s({"items":[1,2]})
+             |> raw_ledger()
+             |> MergeAuthorizationLedger.parse_comment()
+  end
+
+  test "ledger rejects malformed wire methods, failures, and common bindings" do
+    valid_common = wire_common("merge_intent")
+
+    cases = [
+      {Map.put(valid_common, "method", "force"), :invalid_merge_method},
+      {valid_common |> Map.put("method", "squash") |> Map.put("repository", "invalid"), :invalid_repository},
+      {wire_common("merge_completed") |> Map.merge(%{"method" => "force", "merge_sha" => @merge_sha}), :invalid_merge_method},
+      {wire_common("merge_completed") |> Map.merge(%{"method" => "squash", "merge_sha" => "bad"}), :invalid_sha},
+      {wire_common("merge_failed") |> Map.merge(%{"method" => "force", "failure" => "conflict"}), :invalid_merge_method},
+      {wire_common("merge_failed") |> Map.merge(%{"method" => "squash", "failure" => "mystery"}), :invalid_merge_failure},
+      {wire_common("merge_failed")
+       |> Map.merge(%{"method" => "squash", "failure" => "conflict", "pull_request_number" => 0}), :invalid_pull_request_number}
+    ]
+
+    for {payload, expected} <- cases do
+      assert {:error, ^expected} =
+               payload |> Jason.encode!() |> raw_ledger() |> MergeAuthorizationLedger.parse_comment()
+    end
+  end
+
+  test "ledger event encoding rejects invalid values without weakening its schema" do
+    operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
+    intent = intent_event(operation_id)
+
+    invalid_events = [
+      %{release_event(operation_id) | pull_request_number: 0},
+      intent |> Map.put(:kind, :merge_completed) |> Map.put(:merge_sha, "bad"),
+      intent |> Map.put(:kind, :merge_failed) |> Map.put(:failure, :unknown_failure),
+      %{intent | method: "force"},
+      %{kind: :unknown},
+      Map.put(release_event(operation_id), :extra, true)
+    ]
+
+    for event <- invalid_events do
+      assert {:error, :invalid_merge_event} = MergeAuthorizationLedger.encode(event)
+    end
+  end
+
+  test "ledger history rejects missing, duplicate, and contradictory transitions" do
+    operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
+    release = release_event(operation_id)
+    intent = intent_event(operation_id)
+    completion = Map.merge(intent, %{kind: :merge_completed, merge_sha: @merge_sha})
+    failure = Map.merge(intent, %{kind: :merge_failed, failure: :conflict})
+
+    release_body = ledger_body(release)
+    intent_body = ledger_body(intent)
+    completion_body = ledger_body(completion)
+    failure_body = ledger_body(failure)
+
+    assert {:ok, %{releases: releases}} =
+             MergeAuthorizationLedger.history(["ordinary", release_body, release_body])
+
+    assert releases[operation_id] == release
+
+    conflicting_release = %{release | head_sha: String.duplicate("d", 40)}
+
+    assert {:error, :contradictory_merge_event} =
+             MergeAuthorizationLedger.history([release_body, ledger_body(conflicting_release)])
+
+    assert {:error, :malformed_merge_event} =
+             MergeAuthorizationLedger.history(["<!-- symphony-merge-authorization-ledger:v1\n{"])
+
+    assert {:error, :intent_without_release} = MergeAuthorizationLedger.history([intent_body])
+
+    assert {:error, :intent_without_release} =
+             MergeAuthorizationLedger.history([release_body, completion_body])
+
+    assert {:ok, %{failures: failures}} =
+             MergeAuthorizationLedger.history([release_body, intent_body, failure_body])
+
+    assert failures[operation_id] == failure
+
+    mismatched_failure = %{failure | method: "merge"}
+
+    assert {:error, :failure_manifest_mismatch} =
+             MergeAuthorizationLedger.history([
+               release_body,
+               intent_body,
+               ledger_body(mismatched_failure)
+             ])
+
+    assert {:error, :contradictory_merge_outcome} =
+             MergeAuthorizationLedger.history([
+               release_body,
+               intent_body,
+               completion_body,
+               failure_body
+             ])
+  end
+
+  test "pure authorization projects terminal and malformed-history branches" do
+    operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
+    release = release_event(operation_id)
+    intent = intent_event(operation_id)
+    completion = Map.merge(intent, %{kind: :merge_completed, merge_sha: @merge_sha})
+    failure = Map.merge(intent, %{kind: :merge_failed, failure: :conflict})
+
+    base =
+      authorization_input()
+      |> put_in([:merge_history, :releases], %{operation_id => release})
+      |> put_in([:merge_history, :intents], %{operation_id => intent})
+
+    assert %{status: :merge_ready, receipts: [^release, ^intent]} = MergeAuthorization.evaluate(base)
+
+    assert %{status: :merged, receipts: [^release, ^intent, ^completion]} =
+             base
+             |> put_in([:merge_history, :completions], %{operation_id => completion})
+             |> MergeAuthorization.evaluate()
+
+    assert %{status: :merge_failed, failure: :conflict, receipts: [^release, ^intent, ^failure]} =
+             base
+             |> put_in([:merge_history, :failures], %{operation_id => failure})
+             |> MergeAuthorization.evaluate()
+
+    mismatched_intent = %{intent | method: "merge"}
+
+    assert %{status: :holding, reason: :intent_unverified} =
+             base
+             |> put_in([:merge_history, :intents], %{operation_id => mismatched_intent})
+             |> MergeAuthorization.evaluate()
+
+    assert %{status: :holding, reason: :invalid_merge_ledger} =
+             authorization_input()
+             |> Map.put(:merge_history, nil)
+             |> MergeAuthorization.evaluate()
+  end
+
+  test "executor surfaces release, intent, failure, and completion persistence outages" do
+    cases = [
+      {:authorization_release, {:ok, %{merged: true, merge_sha: @merge_sha}}, :holding, :release_persist_failed, :authorization_release, false},
+      {:merge_intent, {:ok, %{merged: true, merge_sha: @merge_sha}}, :merge_ready, :intent_persist_failed, :merge_intent, false},
+      {:merge_failed, {:error, :permission_denied}, :merge_failed, :failure_persist_failed, :merge_failed, true},
+      {:merge_completed, {:ok, %{merged: true, merge_sha: @merge_sha}}, :merged, :completion_persist_failed, :merge_completed, true}
+    ]
+
+    for {failed_event, merge_result, status, reason, pending_kind, merge_called?} <- cases do
+      Application.put_env(:symphony_elixir, :fail_merge_event, failed_event)
+      Application.put_env(:symphony_elixir, :merge_result, merge_result)
+
+      state = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+      merge = state[@issue_id].merge
+
+      assert merge.status == status
+      assert merge.reason == reason
+      assert merge.pending_receipt.kind == pending_kind
+
+      if merge_called? do
+        assert_received {:merge, @repository, 42, @head_sha, "squash"}
+      else
+        refute_received {:merge, _, _, _, _}
+      end
+
+      flush_messages()
+    end
+  end
+
+  test "executor recovery classifies every non-completion PR state without merging" do
+    operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
+    pending_history = history_with_pending_intent(operation_id)
+
+    cases = [
+      {{:ok, %{open_pull_request() | base_sha: String.duplicate("d", 40)}}, :base_moved},
+      {{:ok, %{open_pull_request() | head_sha: String.duplicate("d", 40)}}, :head_moved},
+      {{:ok, %{open_pull_request() | status: :closed}}, :pull_request_closed},
+      {{:error, :rate_limited}, :rate_limited}
+    ]
+
+    for {pull_request_state, failure} <- cases do
+      Application.put_env(:symphony_elixir, :merge_history, pending_history)
+      Application.put_env(:symphony_elixir, :pull_request_state, pull_request_state)
+
+      state = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+
+      assert state[@issue_id].merge.status == :merge_failed
+      assert state[@issue_id].merge.failure == failure
+      refute_received {:merge, _, _, _, _}
+      flush_messages()
+    end
+  end
+
+  test "executor validates fresh PR state before any merge request" do
+    cases = [
+      {{:ok, %{open_pull_request() | base_sha: String.duplicate("d", 40)}}, :merge_failed, :base_moved},
+      {{:ok, %{open_pull_request() | status: :merged, merged: true, merge_sha: @merge_sha}}, :merged, nil},
+      {{:ok, %{open_pull_request() | status: :closed}}, :merge_failed, :pull_request_closed},
+      {{:error, :unexpected_transport}, :merge_failed, :github_unavailable}
+    ]
+
+    for {pull_request_state, status, failure} <- cases do
+      Application.put_env(:symphony_elixir, :merge_history, empty_history())
+      Application.put_env(:symphony_elixir, :pull_request_state, pull_request_state)
+
+      state = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+
+      assert state[@issue_id].merge.status == status
+      assert state[@issue_id].merge.failure == failure
+      refute_received {:merge, _, _, _, _}
+      flush_messages()
+    end
+  end
+
+  test "executor restores durable outcomes and normalizes missing history and settings" do
+    operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
+    release = release_event(operation_id)
+    intent = intent_event(operation_id)
+    completion = Map.merge(intent, %{kind: :merge_completed, merge_sha: @merge_sha})
+    failure = Map.merge(intent, %{kind: :merge_failed, failure: :conflict})
+
+    for {field, event, status, expected_failure} <- [
+          {:completions, completion, :merged, nil},
+          {:failures, failure, :merge_failed, :conflict}
+        ] do
+      merge_history =
+        empty_merge_history()
+        |> put_in([:releases, operation_id], release)
+        |> put_in([:intents, operation_id], intent)
+        |> put_in([field, operation_id], event)
+
+      restored = MergeExecutor.restore(%{}, %{merge: merge_history})
+      assert restored.merge.status == status
+      assert restored.merge.failure == expected_failure
+    end
+
+    assert MergeExecutor.pending_intent(%{merge: nil}) == nil
+    assert %{reason: :disabled, method: "squash"} = MergeExecutor.default_state(%{})
+  end
+
+  test "executor fails closed on ruleset lookup, duplicate evidence, and missing prerequisites" do
+    Application.put_env(:symphony_elixir, :ruleset_result, {:error, :forbidden})
+    unverified = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+    assert unverified[@issue_id].merge.status == :ruleset_unverified
+    flush_messages()
+
+    operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
+    release = release_event(operation_id)
+
+    Application.delete_env(:symphony_elixir, :ruleset_result)
+
+    Application.put_env(
+      :symphony_elixir,
+      :merge_history,
+      empty_history(%{merge: %{empty_merge_history() | releases: %{operation_id => release}}})
+    )
+
+    durable = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+    assert durable[@issue_id].merge.status == :merged
+    assert_received {:merge, @repository, 42, @head_sha, "squash"}
+    flush_messages()
+
+    contradictory_release = %{release | head_sha: String.duplicate("d", 40)}
+
+    Application.put_env(
+      :symphony_elixir,
+      :merge_history,
+      empty_history(%{
+        merge: %{empty_merge_history() | releases: %{operation_id => contradictory_release}}
+      })
+    )
+
+    contradictory = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+    assert contradictory[@issue_id].merge.reason == :release_persist_failed
+    flush_messages()
+
+    dedup_key = "merge-ledger:authorization_release:#{operation_id}"
+    Application.put_env(:symphony_elixir, :merge_history, empty_history(%{dedup: MapSet.new([dedup_key])}))
+
+    deduplicated = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+    assert deduplicated[@issue_id].merge.reason == :release_persist_failed
+    flush_messages()
+
+    pending_completion = Map.merge(intent_event(operation_id), %{kind: :merge_completed, merge_sha: @merge_sha})
+
+    entry = %{
+      dedup: MapSet.new(),
+      convergence_history: %{merge: empty_merge_history()},
+      merge:
+        struct(MergeAuthorization.State,
+          status: :merged,
+          pending_receipt: pending_completion,
+          receipts: [%{unrecognized: true}]
+        )
+    }
+
+    assert MergeExecutor.reconcile(issue(), entry, settings(true), ReviewClient, Tracker, snapshot()) == entry
+  end
+
+  test "executor fails closed when release evidence disappears before intent persistence" do
+    operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
+
+    releases = %SequencedReleaseLookup{
+      lookup_key: operation_id,
+      value: release_event(operation_id)
+    }
+
+    Application.put_env(
+      :symphony_elixir,
+      :merge_history,
+      empty_history(%{merge: %{empty_merge_history() | releases: releases}})
+    )
+
+    state = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+
+    assert state[@issue_id].merge.status == :merge_ready
+    assert state[@issue_id].merge.reason == :intent_persist_failed
+    assert state[@issue_id].merge.pending_receipt.kind == :merge_intent
+    refute_received {:merge, _, _, _, _}
+  end
+
+  defp raw_ledger(json),
+    do: "<!-- symphony-merge-authorization-ledger:v1\n#{json}\n-->"
+
+  defp wire_common(event) do
+    %{
+      "schema_version" => 1,
+      "event" => event,
+      "operation_id" => MergeAuthorization.operation_id(@issue_id, snapshot()),
+      "repository" => @repository,
+      "pull_request_number" => 42,
+      "base_sha" => @base_sha,
+      "head_sha" => @head_sha
+    }
+  end
+
+  defp ledger_body(event) do
+    {:ok, body} = MergeAuthorizationLedger.encode(event)
+    body
+  end
+
+  defp history_with_pending_intent(operation_id) do
+    empty_history(%{
+      merge: %{
+        empty_merge_history()
+        | releases: %{operation_id => release_event(operation_id)},
+          intents: %{operation_id => intent_event(operation_id)}
+      }
+    })
+  end
+
+  defp empty_merge_history do
+    %{releases: %{}, intents: %{}, completions: %{}, failures: %{}, ledger_error: nil}
+  end
+
+  defp flush_messages do
+    receive do
+      _message -> flush_messages()
+    after
+      0 -> :ok
+    end
   end
 
   defp settings(enabled) do
