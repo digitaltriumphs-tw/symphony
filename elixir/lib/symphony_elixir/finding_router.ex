@@ -28,14 +28,14 @@ defmodule SymphonyElixir.FindingRouter do
   }
 
   @root_keys %{
-    same_pr: MapSet.new(["schema_version", "kind", "binding", "scope_ref"]),
-    introduced_by_pr: MapSet.new(["schema_version", "kind", "binding", "proof"]),
-    prerequisite: MapSet.new(["schema_version", "kind", "binding", "scope_ref"]),
-    follow_up: MapSet.new(["schema_version", "kind", "binding", "relation"]),
-    human_hold: MapSet.new(["schema_version", "kind", "binding"])
+    same_pr: ["schema_version", "kind", "binding", "scope_ref"],
+    introduced_by_pr: ["schema_version", "kind", "binding", "proof"],
+    prerequisite: ["schema_version", "kind", "binding", "scope_ref"],
+    follow_up: ["schema_version", "kind", "binding", "relation"],
+    human_hold: ["schema_version", "kind", "binding"]
   }
 
-  @binding_keys MapSet.new(["base_sha", "head_sha", "path"])
+  @binding_keys ["base_sha", "head_sha", "path"]
 
   @type route :: :same_pr | :prerequisite | :follow_up | :human_hold
   @type disposition_kind :: :same_pr | :introduced_by_pr | :prerequisite | :follow_up | :human_hold
@@ -299,12 +299,12 @@ defmodule SymphonyElixir.FindingRouter do
     end
   end
 
-  defp exact_keys(value, expected) when is_map(value) do
-    actual = value |> Map.keys() |> MapSet.new()
+  defp exact_keys(value, expected) when is_map(value) and is_list(expected) do
+    actual = Map.keys(value)
 
     cond do
-      not MapSet.subset?(actual, expected) -> {:error, :unknown_disposition_field}
-      actual != expected -> {:error, :malformed_disposition}
+      actual -- expected != [] -> {:error, :unknown_disposition_field}
+      expected -- actual != [] -> {:error, :malformed_disposition}
       true -> :ok
     end
   end
