@@ -16,7 +16,7 @@ defmodule SymphonyElixir.MergeExecutor do
     merge_settings = merge_settings(settings)
 
     cond do
-      terminal_for_head?(entry[:merge], snapshot.current_head_sha) ->
+      terminal_for_operation?(entry[:merge], issue.id, merge_settings, snapshot) ->
         entry
 
       pending_terminal_receipt?(entry[:merge]) ->
@@ -85,8 +85,7 @@ defmodule SymphonyElixir.MergeExecutor do
     end
   end
 
-  @spec recover(map(), entry(), map(), module(), module(), history()) ::
-          {:resolved, entry()} | {:open, entry()}
+  @spec recover(map(), entry(), map(), module(), module(), history()) :: {:resolved, entry()}
   def recover(issue, entry, _settings, review_client, tracker, history) do
     intent = pending_intent(history)
     merge_history = normalize_history(history[:merge])
@@ -131,7 +130,16 @@ defmodule SymphonyElixir.MergeExecutor do
          )}
 
       {:ok, %{status: :open}} ->
-        {:open, entry}
+        {:resolved,
+         record_failure(
+           issue,
+           entry,
+           tracker,
+           merge_history,
+           authorization,
+           intent,
+           :merge_outcome_unknown
+         )}
 
       {:ok, _closed} ->
         {:resolved,
@@ -646,18 +654,22 @@ defmodule SymphonyElixir.MergeExecutor do
     end
   end
 
-  defp terminal_for_head?(
-         %MergeAuthorization.State{
-           status: status,
-           head_sha: head_sha,
-           pending_receipt: nil
-         },
-         head_sha
+  defp terminal_for_operation?(
+         %MergeAuthorization.State{status: status, pending_receipt: nil} = merge,
+         issue_id,
+         merge_settings,
+         snapshot
        )
-       when status in [:merge_failed, :merged],
-       do: true
+       when status in [:merge_failed, :merged] do
+    expected = MergeAuthorization.operation_identity(issue_id, snapshot, merge_settings.method)
 
-  defp terminal_for_head?(_merge, _head_sha), do: false
+    merge
+    |> Map.from_struct()
+    |> Map.take(Map.keys(expected))
+    |> Kernel.==(expected)
+  end
+
+  defp terminal_for_operation?(_merge, _issue_id, _merge_settings, _snapshot), do: false
 
   defp normalize_failure(reason)
        when reason in [
@@ -668,6 +680,7 @@ defmodule SymphonyElixir.MergeExecutor do
               :rate_limited,
               :github_unavailable,
               :merge_rejected,
+              :merge_outcome_unknown,
               :pull_request_closed,
               :invalid_pull_request_state
             ],

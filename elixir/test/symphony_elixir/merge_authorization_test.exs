@@ -337,6 +337,33 @@ defmodule SymphonyElixir.MergeAuthorizationTest do
            end)
   end
 
+  test "a terminal cache applies only to the exact base and head operation" do
+    Application.put_env(:symphony_elixir, :merge_result, {:error, :permission_denied})
+
+    first = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+    first_operation_id = first[@issue_id].merge.operation_id
+
+    assert_receive {:merge, @repository, 42, @head_sha, "squash"}
+    assert first[@issue_id].merge.status == :merge_failed
+
+    new_base_sha = String.duplicate("d", 40)
+    new_snapshot = %{snapshot() | base_ref_oid: new_base_sha}
+
+    Application.put_env(:symphony_elixir, :merge_snapshot, {:ok, new_snapshot})
+    Application.put_env(:symphony_elixir, :pull_request_state, {:ok, %{open_pull_request() | base_sha: new_base_sha}})
+    Application.put_env(:symphony_elixir, :merge_result, {:ok, %{merged: true, merge_sha: @merge_sha}})
+
+    second = ReviewMonitor.run_with(first, settings(true), ReviewClient, Tracker)
+    expected_operation_id = MergeAuthorization.operation_id(@issue_id, new_snapshot)
+
+    assert_receive {:merge, @repository, 42, @head_sha, "squash"}
+    assert second[@issue_id].merge.status == :merged
+    assert second[@issue_id].merge.base_sha == new_base_sha
+    assert second[@issue_id].merge.operation_id == expected_operation_id
+    refute second[@issue_id].merge.operation_id == first_operation_id
+    refute_receive {:state, _, _}
+  end
+
   test "restart recovers an already-merged intent without a second merge request" do
     operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
 
@@ -367,6 +394,36 @@ defmodule SymphonyElixir.MergeAuthorizationTest do
     refute_receive {:merge, _, _, _, _}
     assert_receive {:comment, @issue_id, completion}
     assert completion =~ ~s("event":"merge_completed")
+    refute_receive {:state, _, _}
+  end
+
+  test "restart with an open exact intent persists unknown outcome and never merges again" do
+    operation_id = MergeAuthorization.operation_id(@issue_id, snapshot())
+
+    Application.put_env(
+      :symphony_elixir,
+      :merge_history,
+      empty_history(%{
+        merge: %{
+          releases: %{operation_id => release_event(operation_id)},
+          intents: %{operation_id => intent_event(operation_id)},
+          completions: %{},
+          failures: %{},
+          ledger_error: nil
+        }
+      })
+    )
+
+    state = ReviewMonitor.run_with(%{}, settings(true), ReviewClient, Tracker)
+
+    assert state[@issue_id].merge.status == :merge_failed
+    assert state[@issue_id].merge.failure == :merge_outcome_unknown
+    refute_receive {:merge, _, _, _, _}
+    assert_receive {:comment, @issue_id, failure_body}
+
+    assert {:ok, %{kind: :merge_failed, failure: :merge_outcome_unknown}} =
+             MergeAuthorizationLedger.parse_comment(failure_body)
+
     refute_receive {:state, _, _}
   end
 

@@ -421,9 +421,13 @@ settings; it MUST NOT create, edit, bypass, or weaken rulesets or branch protect
 The runtime MUST durably record intent before sending exactly one merge request with the expected
 head SHA and configured method. Before sending, and when recovering an incomplete operation, it
 MUST re-read PR open/merged state plus exact base/head identity. If GitHub reports the PR already
-merged, the runtime records completion without another merge request. Conflict, permission or rate
-limit failure, closed PR, or base/head movement MUST produce a typed failure and leave the tracker
-issue In Review. No success receipt may be written for a failed merge.
+merged, the runtime records completion without another merge request. If a durable intent survives
+a restart while GitHub still reports that exact PR/base/head as open, the merge outcome is unknown:
+the runtime MUST durably record `merge_outcome_unknown` and MUST NOT resend the non-idempotent merge
+request. Conflict, permission or rate limit failure, closed PR, or base/head movement MUST produce a
+typed failure and leave the tracker issue In Review. Cached terminal state applies only when
+repository, PR, base SHA, head SHA, method, and operation id all match. No success receipt may be
+written for a failed merge.
 
 Observability is a projection of typed orchestrator state only, with current states `holding`,
 `ruleset_unverified`, `merge_ready`, `merge_failed`, and `merged`. Dashboard or metrics timeouts MUST

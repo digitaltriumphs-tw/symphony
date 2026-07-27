@@ -490,11 +490,13 @@ Convergence Hold plus read-only GitHub evidence that the target branch requires 
 `Review Convergence Gate` and strict branch-up-to-date checks. It never creates or changes a
 ruleset. Before GitHub is called it persists one merge intent bound to repository, PR number, base
 SHA, head SHA, method, and operation id; the request includes the expected head SHA. Completion or
-typed failure is persisted separately, and restart recovery re-reads open/merged state so it never
-sends a second merge for an already-merged PR. Head/base movement, conflict, permission failure,
-rate limit, or missing ruleset evidence keeps the issue In Review. This path does not move Linear to
-Done and does not authorize deployment, production writes, permission changes, admin bypass, force
-merge, or merge queue.
+typed failure is persisted separately. Restart recovery records completion when GitHub reports the
+PR merged; when the same durable intent remains open, it records `merge_outcome_unknown` and never
+resends the non-idempotent merge request. Terminal cache entries must match the exact repository,
+PR, base/head, method, and operation id. Head/base movement, conflict, permission failure, rate
+limit, or missing ruleset evidence keeps the issue In Review. This path does not move Linear to Done
+and does not authorize deployment, production writes, permission changes, admin bypass, force merge,
+or merge queue.
 
 Before returning the issue to In Review, read:
 

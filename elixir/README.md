@@ -74,9 +74,12 @@ accepts only current effective-rules or classic-protection evidence that explici
 `Review Convergence Gate` and strict branch-up-to-date checks. A merge intent is durable before one
 GitHub merge request is sent with the expected head SHA and configured safe method (`merge`,
 `squash`, or `rebase`). Restarts re-read the PR and recover an already-completed merge without
-sending another request. Missing/ambiguous protection, movement, conflicts, permissions, and rate
-limits fail closed while Linear remains In Review. The dashboard and JSON API only project the
-typed current state; they do not query GitHub or control the merge.
+sending another request. If a durable intent survives but that exact PR/base/head is still open,
+the runtime durably records `merge_outcome_unknown` instead of retrying GitHub's non-idempotent
+merge API. Terminal cache entries apply only to the exact repository, PR, base/head, method, and
+operation id. Missing/ambiguous protection, movement, conflicts, permissions, and rate limits fail
+closed while Linear remains In Review. The dashboard and JSON API only project the typed current
+state; they do not query GitHub or control the merge.
 
 ## How to use it
 

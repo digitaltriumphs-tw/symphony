@@ -476,10 +476,10 @@ defmodule SymphonyElixir.ReviewMonitor do
   end
 
   defp recover_pending_merge(issue, entry, state, settings, review_client, tracker, history) do
-    case MergeExecutor.recover(issue, entry, settings, review_client, tracker, history) do
-      {:resolved, entry} -> Map.put(state, issue.id, entry)
-      {:open, entry} -> reconcile_snapshot(issue, entry, state, settings, review_client, tracker)
-    end
+    {:resolved, entry} =
+      MergeExecutor.recover(issue, entry, settings, review_client, tracker, history)
+
+    Map.put(state, issue.id, entry)
   end
 
   defp recover_pending_transitions(issue, entry, state, settings, tracker, pending_transitions) do

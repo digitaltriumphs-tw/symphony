@@ -21,6 +21,7 @@ defmodule SymphonyElixir.MergeAuthorizationLedger do
     "rate_limited" => :rate_limited,
     "github_unavailable" => :github_unavailable,
     "merge_rejected" => :merge_rejected,
+    "merge_outcome_unknown" => :merge_outcome_unknown,
     "pull_request_closed" => :pull_request_closed,
     "invalid_pull_request_state" => :invalid_pull_request_state
   }

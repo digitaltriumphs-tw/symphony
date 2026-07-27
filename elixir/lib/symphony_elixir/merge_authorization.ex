@@ -52,6 +52,15 @@ defmodule SymphonyElixir.MergeAuthorization do
           required(:ruleset_receipt) => map() | nil
         }
 
+  @type operation_identity :: %{
+          required(:repository) => String.t() | nil,
+          required(:pull_request_number) => pos_integer() | nil,
+          required(:base_sha) => String.t() | nil,
+          required(:head_sha) => String.t() | nil,
+          required(:operation_id) => String.t(),
+          required(:method) => String.t() | nil
+        }
+
   @spec evaluate(input()) :: State.t()
   def evaluate(%{} = input) do
     binding = binding(input.issue_id, input.snapshot, input.settings[:method])
@@ -131,6 +140,19 @@ defmodule SymphonyElixir.MergeAuthorization do
     |> Base.encode16(case: :lower)
   end
 
+  @spec operation_identity(String.t(), map(), String.t() | nil) :: operation_identity()
+  def operation_identity(issue_id, snapshot, method)
+      when is_binary(issue_id) and is_map(snapshot) do
+    %{
+      repository: snapshot[:repository],
+      pull_request_number: snapshot[:pull_request_number],
+      base_sha: snapshot[:base_ref_oid],
+      head_sha: snapshot[:current_head_sha],
+      operation_id: operation_id(issue_id, snapshot),
+      method: method
+    }
+  end
+
   @spec release_event(String.t(), map()) :: map()
   def release_event(issue_id, snapshot) when is_binary(issue_id) and is_map(snapshot) do
     issue_id
@@ -140,15 +162,9 @@ defmodule SymphonyElixir.MergeAuthorization do
   end
 
   defp binding(issue_id, snapshot, method) do
-    %{
-      repository: snapshot[:repository],
-      pull_request_number: snapshot[:pull_request_number],
-      base_ref: snapshot[:base_ref_name],
-      base_sha: snapshot[:base_ref_oid],
-      head_sha: snapshot[:current_head_sha],
-      operation_id: operation_id(issue_id, snapshot),
-      method: method
-    }
+    issue_id
+    |> operation_identity(snapshot, method)
+    |> Map.put(:base_ref, snapshot[:base_ref_name])
   end
 
   defp invalid_binding?(binding) do
