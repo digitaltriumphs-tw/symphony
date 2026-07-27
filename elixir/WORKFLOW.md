@@ -42,6 +42,9 @@ review_convergence:
   in_progress_state: "In Progress"
   max_fix_rounds: 3
   human_owner: "PM AROAK"
+merge_authorization:
+  enabled: false
+  method: "squash"
 codex:
   command: |
     ENV_FILE="C:/Users/aroak/Desktop/codex/symphony/elixir/.env.local"
@@ -478,6 +481,20 @@ re-reads durable history after restart, and counts exactly one fix round only af
 is observed and the matching typed cluster manifest is durably completed. Crash recovery reuses the
 same operation ID and cluster IDs. Unknown responses, malformed history, or conflicting evidence
 fail closed and never consume a round.
+
+Authorized Merge Runtime
+
+`merge_authorization.enabled` is separate from Review Convergence and defaults to false in this
+workflow. If the team explicitly enables it, the runtime requires a durable exact release with no
+Convergence Hold plus read-only GitHub evidence that the target branch requires both
+`Review Convergence Gate` and strict branch-up-to-date checks. It never creates or changes a
+ruleset. Before GitHub is called it persists one merge intent bound to repository, PR number, base
+SHA, head SHA, method, and operation id; the request includes the expected head SHA. Completion or
+typed failure is persisted separately, and restart recovery re-reads open/merged state so it never
+sends a second merge for an already-merged PR. Head/base movement, conflict, permission failure,
+rate limit, or missing ruleset evidence keeps the issue In Review. This path does not move Linear to
+Done and does not authorize deployment, production writes, permission changes, admin bypass, force
+merge, or merge queue.
 
 Before returning the issue to In Review, read:
 

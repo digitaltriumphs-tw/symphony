@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.GitHubReviewClient do
-  @moduledoc "Reads latest-head review evidence and requests Codex reviews through `gh`."
+  @moduledoc "Reads latest-head review/ruleset evidence and performs exact-head merges through `gh`."
 
   alias SymphonyElixir.{FindingRouter, ScopeContract}
 
@@ -91,6 +91,8 @@ defmodule SymphonyElixir.GitHubReviewClient do
     %{name: "make-all", app_slug: "github-actions", app_id: 15_368},
     %{name: "validate-pr-description", app_slug: "github-actions", app_id: 15_368}
   ]
+  @review_convergence_context "Review Convergence Gate"
+  @safe_merge_methods ~w(merge squash rebase)
 
   @spec snapshot(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
   def snapshot(repository, branch) when is_binary(repository) and is_binary(branch) do
@@ -157,6 +159,54 @@ defmodule SymphonyElixir.GitHubReviewClient do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  @spec ruleset_receipt(String.t(), String.t()) :: {:ok, map()}
+  def ruleset_receipt(repository, base_ref)
+      when is_binary(repository) and is_binary(base_ref) do
+    rules_result = effective_branch_rules(repository, base_ref)
+
+    protection_result =
+      case normalize_ruleset_receipt(repository, base_ref, rules_result, {:ok, nil}) do
+        %{status: :verified} -> {:ok, nil}
+        _unverified -> branch_protection(repository, base_ref)
+      end
+
+    {:ok, normalize_ruleset_receipt(repository, base_ref, rules_result, protection_result)}
+  end
+
+  @spec pull_request_state(String.t(), pos_integer()) :: {:ok, map()} | {:error, term()}
+  def pull_request_state(repository, number)
+      when is_binary(repository) and is_integer(number) and number > 0 do
+    with {:ok, output} <- run(["api", "repos/#{repository}/pulls/#{number}"]),
+         {:ok, payload} <- Jason.decode(output) do
+      normalize_pull_request_state(payload)
+    end
+  end
+
+  @spec merge_pull_request(String.t(), pos_integer(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, atom()}
+  def merge_pull_request(repository, number, head_sha, method)
+      when is_binary(repository) and is_integer(number) and number > 0 and
+             is_binary(head_sha) and method in @safe_merge_methods do
+    {output, status} =
+      run_with_status([
+        "api",
+        "repos/#{repository}/pulls/#{number}/merge",
+        "--method",
+        "PUT",
+        "-f",
+        "sha=#{head_sha}",
+        "-f",
+        "merge_method=#{method}"
+      ])
+
+    normalize_merge_response(output, status)
+  rescue
+    _error -> {:error, :github_unavailable}
+  end
+
+  def merge_pull_request(_repository, _number, _head_sha, _method),
+    do: {:error, :merge_rejected}
 
   @doc false
   @spec normalize_no_required_checks_for_test(String.t()) :: {:ok, []} | {:error, term()}
@@ -237,6 +287,19 @@ defmodule SymphonyElixir.GitHubReviewClient do
           {:ok, map() | nil} | {:error, term()}
   def normalize_branch_protection_response_for_test(output, status),
     do: normalize_branch_protection_response(output, status)
+
+  @doc false
+  @spec normalize_ruleset_receipt_for_test(String.t(), String.t(), term(), term()) :: map()
+  def normalize_ruleset_receipt_for_test(repository, base_ref, rules_result, protection_result),
+    do: normalize_ruleset_receipt(repository, base_ref, rules_result, protection_result)
+
+  @doc false
+  @spec normalize_merge_response_for_test(String.t(), integer()) :: {:ok, map()} | {:error, atom()}
+  def normalize_merge_response_for_test(output, status), do: normalize_merge_response(output, status)
+
+  @doc false
+  @spec normalize_pull_request_state_for_test(map()) :: {:ok, map()} | {:error, term()}
+  def normalize_pull_request_state_for_test(payload), do: normalize_pull_request_state(payload)
 
   @doc false
   @spec pull_request_query_for_test() :: String.t()
@@ -350,6 +413,206 @@ defmodule SymphonyElixir.GitHubReviewClient do
         {:error, reason}
     end
   end
+
+  defp effective_branch_rules(repository, base_ref) do
+    with {:ok, output} <-
+           run([
+             "api",
+             "--paginate",
+             "--slurp",
+             "repos/#{repository}/rules/branches/#{encode_path_segment(base_ref)}?per_page=100"
+           ]),
+         {:ok, pages} when is_list(pages) <- Jason.decode(output),
+         rules when is_list(rules) <- List.flatten(pages) do
+      {:ok, rules}
+    else
+      {:error, reason} -> {:error, reason}
+      unexpected -> {:error, {:invalid_effective_rules, unexpected}}
+    end
+  end
+
+  defp normalize_ruleset_receipt(repository, base_ref, rules_result, protection_result) do
+    base = %{
+      status: :unverified,
+      repository: repository,
+      base_ref: base_ref,
+      source: nil,
+      required_context: nil,
+      strict: false
+    }
+
+    case ruleset_evidence(rules_result) do
+      {:verified, :ruleset} ->
+        %{base | status: :verified, source: :ruleset, required_context: @review_convergence_context, strict: true}
+
+      :absent ->
+        case classic_protection_evidence(protection_result) do
+          :verified ->
+            %{base | status: :verified, source: :classic, required_context: @review_convergence_context, strict: true}
+
+          {:unverified, reason} ->
+            Map.put(base, :reason, reason)
+        end
+
+      {:unverified, reason} ->
+        Map.put(base, :reason, reason)
+    end
+  end
+
+  defp ruleset_evidence({:error, _reason}), do: {:unverified, :effective_rules_unverified}
+
+  defp ruleset_evidence({:ok, rules}) when is_list(rules) do
+    if Enum.all?(rules, &is_map/1) do
+      required_rules = Enum.filter(rules, &(&1["type"] == "required_status_checks"))
+
+      cond do
+        required_rules == [] ->
+          :absent
+
+        Enum.any?(required_rules, &(ruleset_status_check_evidence(&1) == :invalid)) ->
+          {:unverified, :ambiguous_effective_rules}
+
+        Enum.any?(required_rules, &(ruleset_status_check_evidence(&1) == :verified)) ->
+          {:verified, :ruleset}
+
+        true ->
+          :absent
+      end
+    else
+      {:unverified, :ambiguous_effective_rules}
+    end
+  end
+
+  defp ruleset_evidence(_unexpected), do: {:unverified, :ambiguous_effective_rules}
+
+  defp ruleset_status_check_evidence(%{
+         "parameters" => %{
+           "strict_required_status_checks_policy" => strict,
+           "required_status_checks" => checks
+         }
+       })
+       when is_boolean(strict) and is_list(checks) do
+    required_context_present? =
+      Enum.any?(checks, &(&1["context"] == @review_convergence_context))
+
+    cond do
+      not Enum.all?(checks, &valid_ruleset_check?/1) -> :invalid
+      not required_context_present? -> :absent
+      strict -> :verified
+      true -> :invalid
+    end
+  end
+
+  defp ruleset_status_check_evidence(_rule), do: :invalid
+
+  defp valid_ruleset_check?(%{"context" => context}) when is_binary(context), do: true
+  defp valid_ruleset_check?(_check), do: false
+
+  defp classic_protection_evidence({:ok, nil}), do: {:unverified, :required_protection_missing}
+
+  defp classic_protection_evidence({:ok, %{"strict" => strict} = protection})
+       when is_boolean(strict) do
+    checks = protection["checks"] || []
+    legacy_contexts = protection["contexts"] || []
+
+    if is_list(checks) and is_list(legacy_contexts) do
+      classify_classic_protection(checks, legacy_contexts, strict)
+    else
+      {:unverified, :ambiguous_classic_protection}
+    end
+  end
+
+  defp classic_protection_evidence({:ok, _unexpected}),
+    do: {:unverified, :ambiguous_classic_protection}
+
+  defp classic_protection_evidence({:error, _reason}),
+    do: {:unverified, :classic_protection_unverified}
+
+  defp classic_protection_evidence(_unexpected),
+    do: {:unverified, :classic_protection_unverified}
+
+  defp classify_classic_protection(checks, legacy_contexts, strict) do
+    contexts =
+      Enum.map(checks, fn
+        %{"context" => context} when is_binary(context) -> context
+        _invalid -> :invalid
+      end)
+
+    combined = contexts ++ legacy_contexts
+
+    cond do
+      Enum.any?(combined, &(&1 == :invalid or not is_binary(&1))) ->
+        {:unverified, :ambiguous_classic_protection}
+
+      strict and @review_convergence_context in combined ->
+        :verified
+
+      true ->
+        {:unverified, :required_protection_missing}
+    end
+  end
+
+  defp normalize_pull_request_state(
+         %{
+           "state" => state,
+           "merged" => merged,
+           "base" => %{"ref" => base_ref, "sha" => base_sha},
+           "head" => %{"sha" => head_sha}
+         } = payload
+       )
+       when state in ["open", "closed"] and is_boolean(merged) and is_binary(base_ref) and
+              is_binary(base_sha) and is_binary(head_sha) do
+    status = if merged, do: :merged, else: String.to_existing_atom(state)
+    merge_sha = payload["merge_commit_sha"]
+
+    if merged and not valid_git_sha?(merge_sha) do
+      {:error, :invalid_pull_request_state}
+    else
+      {:ok,
+       %{
+         status: status,
+         merged: merged,
+         base_ref: base_ref,
+         base_sha: base_sha,
+         head_sha: head_sha,
+         merge_sha: merge_sha
+       }}
+    end
+  end
+
+  defp normalize_pull_request_state(_payload), do: {:error, :invalid_pull_request_state}
+
+  defp normalize_merge_response(output, 0) do
+    case Jason.decode(output) do
+      {:ok, %{"merged" => true, "sha" => merge_sha}} when is_binary(merge_sha) ->
+        if valid_git_sha?(merge_sha),
+          do: {:ok, %{merged: true, merge_sha: merge_sha}},
+          else: {:error, :merge_rejected}
+
+      {:ok, %{"merged" => false}} ->
+        {:error, :merge_rejected}
+
+      _unexpected ->
+        {:error, :github_unavailable}
+    end
+  end
+
+  defp normalize_merge_response(output, _status) do
+    normalized = String.downcase(output)
+
+    cond do
+      String.contains?(normalized, "rate limit") -> {:error, :rate_limited}
+      String.contains?(normalized, "http 409") -> {:error, :head_moved}
+      String.contains?(normalized, "http 405") -> {:error, :conflict}
+      String.contains?(normalized, "http 403") -> {:error, :permission_denied}
+      String.contains?(normalized, "http 404") -> {:error, :permission_denied}
+      String.contains?(normalized, "http 422") -> {:error, :merge_rejected}
+      true -> {:error, :github_unavailable}
+    end
+  end
+
+  defp valid_git_sha?(value),
+    do: is_binary(value) and byte_size(value) in [40, 64] and value =~ ~r/\A[0-9a-f]+\z/
 
   defp required_checks(repository, pull_request) do
     head_sha = pull_request["headRefOid"]

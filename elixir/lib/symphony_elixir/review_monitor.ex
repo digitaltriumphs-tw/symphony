@@ -3,14 +3,27 @@ defmodule SymphonyElixir.ReviewMonitor do
 
   require Logger
 
-  alias SymphonyElixir.{Config, GitHubReviewClient, ReviewConvergence, ReviewConvergenceLedger, Tracker}
+  alias SymphonyElixir.{
+    Config,
+    GitHubReviewClient,
+    MergeExecutor,
+    ReviewConvergence,
+    ReviewConvergenceLedger,
+    Tracker
+  }
+
   alias SymphonyElixir.Linear.Issue
 
   @type state :: %{optional(String.t()) => map()}
 
   @spec run(state()) :: state()
   def run(state) when is_map(state) do
-    settings = Config.settings!().review_convergence
+    config = Config.settings!()
+
+    settings =
+      config.review_convergence
+      |> Map.from_struct()
+      |> Map.put(:merge_authorization, config.merge_authorization)
 
     if settings.enabled do
       run_with(state, settings, GitHubReviewClient, Tracker)
@@ -49,10 +62,11 @@ defmodule SymphonyElixir.ReviewMonitor do
         review_requested: false,
         waiting: false,
         fetch_failed: false,
-        last_finding_fingerprint: nil
+        last_finding_fingerprint: nil,
+        merge: MergeExecutor.default_state(settings)
       })
 
-    entry = Map.put(entry, :fetch_failed, false)
+    entry = entry |> Map.put(:fetch_failed, false) |> Map.put(:identifier, issue.identifier)
 
     case tracker.review_history(issue.id) do
       {:ok, history} ->
@@ -73,6 +87,7 @@ defmodule SymphonyElixir.ReviewMonitor do
           entry
           |> Map.put(:pending_transitions, pending_transitions)
           |> Map.put(:convergence_history, convergence_history)
+          |> MergeExecutor.restore(history)
 
         cond do
           map_size(pending_transitions) > 0 ->
@@ -84,6 +99,9 @@ defmodule SymphonyElixir.ReviewMonitor do
               tracker,
               pending_transitions
             )
+
+          MergeExecutor.pending_intent(history) ->
+            recover_pending_merge(issue, entry, state, settings, review_client, tracker, history)
 
           issue.state == settings.review_state ->
             reconcile_snapshot(issue, entry, state, settings, review_client, tracker)
@@ -183,7 +201,11 @@ defmodule SymphonyElixir.ReviewMonitor do
   end
 
   defp invalidate_old_head(%{head_sha: head_sha} = entry, current_head) when head_sha != current_head do
-    %{entry | head_sha: current_head, review_requested: false, waiting: false}
+    entry
+    |> Map.put(:head_sha, current_head)
+    |> Map.put(:review_requested, false)
+    |> Map.put(:waiting, false)
+    |> Map.put(:merge, nil)
   end
 
   defp invalidate_old_head(entry, current_head), do: Map.put(entry, :head_sha, current_head)
@@ -322,9 +344,16 @@ defmodule SymphonyElixir.ReviewMonitor do
 
     case status_result do
       :ok ->
-        entry
-        |> mark_published_status(snapshot, :success)
-        |> dedup_action(key, fn -> tracker.create_comment(issue.id, converged_comment(snapshot, key)) end)
+        {entry, convergence_result} =
+          entry
+          |> mark_published_status(snapshot, :success)
+          |> dedup_action(key, fn -> tracker.create_comment(issue.id, converged_comment(snapshot, key)) end)
+
+        if convergence_result in [:ok, :deduplicated] do
+          {MergeExecutor.reconcile(issue, entry, settings, review_client, tracker, snapshot), :ok}
+        else
+          {entry, convergence_result}
+        end
 
       {:error, reason} ->
         {entry, {:error, reason}}
@@ -443,6 +472,13 @@ defmodule SymphonyElixir.ReviewMonitor do
       move_and_complete_transition(issue, entry, tracker, intent)
     else
       {entry, intent_result, false}
+    end
+  end
+
+  defp recover_pending_merge(issue, entry, state, settings, review_client, tracker, history) do
+    case MergeExecutor.recover(issue, entry, settings, review_client, tracker, history) do
+      {:resolved, entry} -> Map.put(state, issue.id, entry)
+      {:open, entry} -> reconcile_snapshot(issue, entry, state, settings, review_client, tracker)
     end
   end
 
@@ -608,6 +644,13 @@ defmodule SymphonyElixir.ReviewMonitor do
         last_completed_rework: nil,
         completed_cluster_ids_by_head: %{},
         holds_by_head: %{},
+        merge: %{
+          releases: %{},
+          intents: %{},
+          completions: %{},
+          failures: %{},
+          ledger_error: nil
+        },
         ledger_error: nil,
         last_head_sha: nil
       },

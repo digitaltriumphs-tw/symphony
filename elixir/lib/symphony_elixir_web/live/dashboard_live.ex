@@ -112,6 +112,29 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
         </section>
 
+        <%= if @payload[:merge_counts] do %>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Merge authorization</h2>
+                <p class="section-copy">Current exact-head authorization state from the orchestrator.</p>
+              </div>
+            </div>
+
+            <div class="metric-grid">
+              <article
+                :for={{state, label} <- merge_metric_states()}
+                class="metric-card"
+                data-merge-state={state}
+              >
+                <p class="metric-label"><%= label %></p>
+                <p class="metric-value numeric"><%= Map.fetch!(@payload.merge_counts, String.to_existing_atom(state)) %></p>
+                <p class="metric-detail">Current issues in this merge state.</p>
+              </article>
+            </div>
+          </section>
+        <% end %>
+
         <section class="section-card">
           <div class="section-header">
             <div>
@@ -435,6 +458,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
       String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
       true -> base
     end
+  end
+
+  defp merge_metric_states do
+    [
+      {"holding", "Holding"},
+      {"ruleset_unverified", "Ruleset unverified"},
+      {"merge_ready", "Merge ready"},
+      {"merge_failed", "Merge failed"},
+      {"merged", "Merged"}
+    ]
   end
 
   defp schedule_runtime_tick do

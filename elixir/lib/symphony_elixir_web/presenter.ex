@@ -11,7 +11,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
-        %{
+        payload = %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
@@ -24,6 +24,16 @@ defmodule SymphonyElixirWeb.Presenter do
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
+
+        if Map.has_key?(snapshot, :review_convergence) do
+          merges = merge_entries_payload(snapshot.review_convergence)
+
+          payload
+          |> Map.put(:merge_counts, merge_counts(merges))
+          |> Map.put(:merges, merges)
+        else
+          payload
+        end
 
       :timeout ->
         %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
@@ -149,6 +159,49 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       last_event_at: iso8601(entry.last_codex_timestamp)
     }
+  end
+
+  defp merge_entries_payload(entries) when is_map(entries) do
+    entries
+    |> Enum.flat_map(fn {issue_id, entry} ->
+      case entry[:merge] do
+        %{status: status} = merge
+        when status in [:holding, :ruleset_unverified, :merge_ready, :merge_failed, :merged] ->
+          [
+            %{
+              issue_id: issue_id,
+              issue_identifier: entry[:identifier],
+              state: Atom.to_string(status),
+              repository: Map.get(merge, :repository),
+              pull_request_number: Map.get(merge, :pull_request_number),
+              base_sha: Map.get(merge, :base_sha),
+              head_sha: Map.get(merge, :head_sha),
+              operation_id: Map.get(merge, :operation_id),
+              failure: Map.get(merge, :failure) && Atom.to_string(Map.get(merge, :failure))
+            }
+          ]
+
+        _missing ->
+          []
+      end
+    end)
+    |> Enum.sort_by(&{&1.state, &1.issue_identifier || &1.issue_id})
+  end
+
+  defp merge_entries_payload(_entries), do: []
+
+  defp merge_counts(entries) do
+    initial = %{
+      holding: 0,
+      ruleset_unverified: 0,
+      merge_ready: 0,
+      merge_failed: 0,
+      merged: 0
+    }
+
+    Enum.reduce(entries, initial, fn entry, counts ->
+      Map.update!(counts, String.to_existing_atom(entry.state), &(&1 + 1))
+    end)
   end
 
   defp running_issue_payload(running) do

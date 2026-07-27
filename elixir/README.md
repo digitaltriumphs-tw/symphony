@@ -49,8 +49,8 @@ and reviewed commit. Each actionable finding must carry one exact
 base SHA, head SHA, path, and typed PR Scope Contract. Only verified same-PR findings return the
 issue to the configured in-progress state. Missing, untrusted, malformed, stale, prerequisite,
 follow-up, and explicit hold findings remain In Review in one stable deduplicated hold record;
-mixed held evidence is recorded before verified same-PR repair. The monitor never merges or moves
-an issue to Done.
+mixed held evidence is recorded before verified same-PR repair. Review convergence never authorizes
+merge by itself, and the monitor never moves an issue to Done.
 Rework uses Linear comment history as a scoped durable transition log: an operation intent is
 persisted before the state change, each step is retry-safe, and an incomplete operation is resumed
 even after the issue has entered In Progress or the runtime has restarted. A fix round is counted
@@ -67,6 +67,16 @@ state update or rereview is issued, and hold-only routed findings consume no rou
 Each decision publishes the fixed GitHub commit status context `Review Convergence Gate`. Configure
 that context as required only after the runtime change is deployed and live-smoked; keep existing
 human approval protection until then.
+
+`merge_authorization.enabled` is a separate, default-off policy. When enabled, the runtime first
+persists a release bound to repository, PR number, base SHA, head SHA, and operation id. It then
+accepts only current effective-rules or classic-protection evidence that explicitly requires
+`Review Convergence Gate` and strict branch-up-to-date checks. A merge intent is durable before one
+GitHub merge request is sent with the expected head SHA and configured safe method (`merge`,
+`squash`, or `rebase`). Restarts re-read the PR and recover an already-completed merge without
+sending another request. Missing/ambiguous protection, movement, conflicts, permissions, and rate
+limits fail closed while Linear remains In Review. The dashboard and JSON API only project the
+typed current state; they do not query GitHub or control the merge.
 
 ## How to use it
 
@@ -172,6 +182,8 @@ Notes:
 - `review_convergence.enabled` defaults to `false`. When enabled, `repository` is required in
   `owner/name` form. `review_state`, `in_progress_state`, `max_fix_rounds`, and `human_owner`
   configure monitoring, rework, and escalation without changing merge authorization.
+- `merge_authorization.enabled` defaults to `false` and is evaluated separately from technical
+  convergence. `method` defaults to `squash` and accepts only `merge`, `squash`, or `rebase`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

@@ -114,6 +114,8 @@ defmodule SymphonyElixir.TestSupport do
           review_convergence_in_progress_state: "In Progress",
           review_convergence_max_fix_rounds: 3,
           review_convergence_human_owner: nil,
+          merge_authorization_enabled: false,
+          merge_authorization_method: "squash",
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -158,6 +160,8 @@ defmodule SymphonyElixir.TestSupport do
     review_convergence_in_progress_state = Keyword.get(config, :review_convergence_in_progress_state)
     review_convergence_max_fix_rounds = Keyword.get(config, :review_convergence_max_fix_rounds)
     review_convergence_human_owner = Keyword.get(config, :review_convergence_human_owner)
+    merge_authorization_enabled = Keyword.get(config, :merge_authorization_enabled)
+    merge_authorization_method = Keyword.get(config, :merge_authorization_method)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -206,6 +210,9 @@ defmodule SymphonyElixir.TestSupport do
         "  in_progress_state: #{yaml_value(review_convergence_in_progress_state)}",
         "  max_fix_rounds: #{yaml_value(review_convergence_max_fix_rounds)}",
         "  human_owner: #{yaml_value(review_convergence_human_owner)}",
+        "merge_authorization:",
+        "  enabled: #{yaml_value(merge_authorization_enabled)}",
+        "  method: #{yaml_value(merge_authorization_method)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",

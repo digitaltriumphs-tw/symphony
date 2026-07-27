@@ -645,6 +645,63 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute render(view) =~ "javascript:alert"
   end
 
+  test "merge authorization current-state counts agree across Presenter API and DashboardLive" do
+    orchestrator_name = Module.concat(__MODULE__, :MergeMetricsOrchestrator)
+
+    merge_entries =
+      [:holding, :ruleset_unverified, :merge_ready, :merge_failed, :merged]
+      |> Enum.with_index(1)
+      |> Map.new(fn {status, index} ->
+        issue_id = "merge-#{index}"
+
+        {issue_id,
+         %{
+           identifier: "ARO-#{200 + index}",
+           merge:
+             struct(SymphonyElixir.MergeAuthorization.State,
+               status: status,
+               repository: "aroakpm-svg/repo",
+               pull_request_number: 40 + index,
+               base_sha: String.duplicate("b", 40),
+               head_sha: String.duplicate(Integer.to_string(index), 40),
+               operation_id: String.duplicate(Integer.to_string(index), 64),
+               failure: if(status == :merge_failed, do: :permission_denied, else: nil)
+             )
+         }}
+      end)
+
+    snapshot = Map.put(static_snapshot(), :review_convergence, merge_entries)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    payload = get(build_conn(), "/api/v1/state") |> json_response(200)
+
+    assert payload["merge_counts"] == %{
+             "holding" => 1,
+             "ruleset_unverified" => 1,
+             "merge_ready" => 1,
+             "merge_failed" => 1,
+             "merged" => 1
+           }
+
+    assert Enum.frequencies_by(payload["merges"], & &1["state"]) == payload["merge_counts"]
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Merge authorization"
+
+    for state <- ~w(holding ruleset_unverified merge_ready merge_failed merged) do
+      assert html =~ ~s(data-merge-state="#{state}")
+      assert html =~ ~r/data-merge-state="#{state}"[^>]*>[\s\S]*?metric-value[^>]*>1</
+    end
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),

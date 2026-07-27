@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Linear.Adapter do
   @behaviour SymphonyElixir.Tracker
 
   alias SymphonyElixir.Linear.Client
-  alias SymphonyElixir.ReviewConvergenceLedger
+  alias SymphonyElixir.{MergeAuthorizationLedger, ReviewConvergenceLedger}
 
   @review_history_query """
   query SymphonyReviewHistory($issueId: String!, $first: Int!, $after: String) {
@@ -157,21 +157,35 @@ defmodule SymphonyElixir.Linear.Adapter do
       last_head_sha: history.last_head_sha
     }
 
-    case ReviewConvergenceLedger.history(Enum.reverse(history.comment_bodies)) do
-      {:ok, ledger_history} ->
-        {:ok, Map.merge(base, Map.put(ledger_history, :ledger_error, nil))}
+    comments = Enum.reverse(history.comment_bodies)
 
-      {:error, reason} ->
-        {:ok,
-         Map.merge(base, %{
-           rework_count: 0,
-           pending_transitions: %{},
-           last_completed_rework: nil,
-           completed_cluster_ids_by_head: %{},
-           holds_by_head: %{},
-           ledger_error: reason
-         })}
-    end
+    convergence =
+      case ReviewConvergenceLedger.history(comments) do
+        {:ok, ledger_history} ->
+          Map.put(ledger_history, :ledger_error, nil)
+
+        {:error, reason} ->
+          %{
+            rework_count: 0,
+            pending_transitions: %{},
+            last_completed_rework: nil,
+            completed_cluster_ids_by_head: %{},
+            holds_by_head: %{},
+            ledger_error: reason
+          }
+      end
+
+    merge =
+      case MergeAuthorizationLedger.history(comments) do
+        {:ok, merge_history} -> Map.put(merge_history, :ledger_error, nil)
+        {:error, reason} -> empty_merge_history(reason)
+      end
+
+    {:ok, base |> Map.merge(convergence) |> Map.put(:merge, merge)}
+  end
+
+  defp empty_merge_history(error) do
+    %{releases: %{}, intents: %{}, completions: %{}, failures: %{}, ledger_error: error}
   end
 
   defp legacy_rework_comment?(body) do

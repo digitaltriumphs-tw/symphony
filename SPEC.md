@@ -334,6 +334,7 @@ Top-level keys:
 - `agent`
 - `codex`
 - `review_convergence` (implementation extension)
+- `merge_authorization` (implementation extension)
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -397,9 +398,38 @@ Any current cluster overlap with a completed round for the same exact head, incl
 repeated and new clusters, MUST hold the whole issue. Exhausting the existing `max_fix_rounds` budget
 or receiving unclusterable evidence has the same result. Convergence Hold remains In Review, emits
 one deduplicated team human decision, and MUST NOT update tracker state or request another review.
-Only a successfully completed typed same-PR transition consumes one round. This extension does not
-add readiness evaluation, new configuration, ruleset or merge authorization, cross-PR clustering,
-automatic human override, or metrics.
+Only a successfully completed typed same-PR transition consumes one round. Review convergence
+itself does not grant ruleset or merge authority; the separate default-off extension below consumes
+its durable evidence. This section adds no readiness evaluation, cross-PR clustering, or automatic
+human override.
+
+#### 5.3.8 `merge_authorization` (implementation extension)
+
+`enabled` defaults to `false`. `method` defaults to `squash` and MUST be one of `merge`, `squash`,
+or `rebase`. Enabling this extension does not alter `ReviewConvergence`; merge authorization is a
+separate pure policy over current PR identity, durable convergence hold/release evidence, durable
+merge history, and a read-only ruleset receipt.
+
+An authorization release and every merge event MUST bind the repository, pull request number, base
+SHA, head SHA, and stable operation id. A current Convergence Hold, malformed history, missing or
+mismatched release, or any binding mismatch MUST block merge. GitHub protection is authoritative
+only when effective branch rules or classic branch protection explicitly proves both the required
+`Review Convergence Gate` context and strict branch-up-to-date checks. A 403, 404, malformed,
+ambiguous, missing, or non-strict response MUST remain unverified. The runtime only reads these
+settings; it MUST NOT create, edit, bypass, or weaken rulesets or branch protection.
+
+The runtime MUST durably record intent before sending exactly one merge request with the expected
+head SHA and configured method. Before sending, and when recovering an incomplete operation, it
+MUST re-read PR open/merged state plus exact base/head identity. If GitHub reports the PR already
+merged, the runtime records completion without another merge request. Conflict, permission or rate
+limit failure, closed PR, or base/head movement MUST produce a typed failure and leave the tracker
+issue In Review. No success receipt may be written for a failed merge.
+
+Observability is a projection of typed orchestrator state only, with current states `holding`,
+`ruleset_unverified`, `merge_ready`, `merge_failed`, and `merged`. Dashboard or metrics timeouts MUST
+NOT participate in authorization and UI code MUST NOT query GitHub. This extension adds no terminal
+tracker transition, deployment, production write, admin bypass, force merge, merge queue, historic
+analytics database, or telemetry exporter.
 
 Note:
 
