@@ -10,6 +10,8 @@ defmodule SymphonyElixir.ReviewConvergenceLedger do
   @sentinel_open "<!-- symphony-review-convergence-ledger:v1\n"
   @sentinel_close "\n-->"
   @cluster_id_pattern ~r/\Asymphony-review-finding-cluster:v1:[0-9a-f]{64}\z/
+  @head_sha_pattern ~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/
+  @dedup_id_pattern ~r/\A[0-9a-f]{64}\z/
 
   @transition_keys [
     "schema_version",
@@ -81,6 +83,9 @@ defmodule SymphonyElixir.ReviewConvergenceLedger do
           | :unknown_ledger_event
           | :unknown_ledger_field
           | :invalid_ledger_event
+          | :invalid_operation_id
+          | :invalid_hold_id
+          | :invalid_head_sha
           | :invalid_cluster_id
           | :noncanonical_cluster_ids
 
@@ -215,9 +220,9 @@ defmodule SymphonyElixir.ReviewConvergenceLedger do
   defp wire_to_event(%{"schema_version" => 1, "event" => event} = payload)
        when event in ["rework_intent", "rework_completed"] do
     with :ok <- exact_keys(payload, @transition_keys),
-         :ok <- valid_nonblank(payload["operation_id"]),
+         :ok <- valid_operation_id(payload["operation_id"]),
          :ok <- valid_round(payload["round"]),
-         :ok <- valid_nonblank(payload["head_sha"]),
+         :ok <- valid_head_sha(payload["head_sha"]),
          :ok <- valid_nonblank(payload["target_state"]),
          {:ok, cluster_ids} <- parse_cluster_ids(payload["cluster_ids"], false) do
       {:ok,
@@ -234,8 +239,8 @@ defmodule SymphonyElixir.ReviewConvergenceLedger do
 
   defp wire_to_event(%{"schema_version" => 1, "event" => "convergence_hold"} = payload) do
     with :ok <- exact_keys(payload, @hold_keys),
-         :ok <- valid_nonblank(payload["hold_id"]),
-         :ok <- valid_nonblank(payload["head_sha"]),
+         :ok <- valid_hold_id(payload["hold_id"]),
+         :ok <- valid_head_sha(payload["head_sha"]),
          {:ok, reason} <- hold_reason(payload["reason"]),
          {:ok, cluster_ids} <- parse_cluster_ids(payload["cluster_ids"], true) do
       {:ok,
@@ -256,9 +261,9 @@ defmodule SymphonyElixir.ReviewConvergenceLedger do
 
   defp event_to_wire(%{kind: kind} = event) when kind in [:rework_intent, :rework_completed] do
     with :ok <- exact_atom_keys(event, [:kind, :operation_id, :round, :head_sha, :target_state, :cluster_ids]),
-         :ok <- valid_nonblank(event.operation_id),
+         :ok <- valid_operation_id(event.operation_id),
          :ok <- valid_round(event.round),
-         :ok <- valid_nonblank(event.head_sha),
+         :ok <- valid_head_sha(event.head_sha),
          :ok <- valid_nonblank(event.target_state),
          {:ok, cluster_ids} <- canonical_cluster_ids(event.cluster_ids, false) do
       {:ok,
@@ -276,8 +281,8 @@ defmodule SymphonyElixir.ReviewConvergenceLedger do
 
   defp event_to_wire(%{kind: :convergence_hold} = event) do
     with :ok <- exact_atom_keys(event, [:kind, :hold_id, :head_sha, :reason, :cluster_ids]),
-         :ok <- valid_nonblank(event.hold_id),
-         :ok <- valid_nonblank(event.head_sha),
+         :ok <- valid_hold_id(event.hold_id),
+         :ok <- valid_head_sha(event.head_sha),
          {:ok, reason} <- Map.fetch(@wire_reason_by_atom, event.reason),
          {:ok, cluster_ids} <- canonical_cluster_ids(event.cluster_ids, true) do
       {:ok,
@@ -315,6 +320,14 @@ defmodule SymphonyElixir.ReviewConvergenceLedger do
 
   defp valid_nonblank(value) do
     if nonblank?(value), do: :ok, else: {:error, :invalid_ledger_event}
+  end
+
+  defp valid_operation_id(value), do: valid_pattern(value, @dedup_id_pattern, :invalid_operation_id)
+  defp valid_hold_id(value), do: valid_pattern(value, @dedup_id_pattern, :invalid_hold_id)
+  defp valid_head_sha(value), do: valid_pattern(value, @head_sha_pattern, :invalid_head_sha)
+
+  defp valid_pattern(value, pattern, error) do
+    if is_binary(value) and Regex.match?(pattern, value), do: :ok, else: {:error, error}
   end
 
   defp valid_round(round) do

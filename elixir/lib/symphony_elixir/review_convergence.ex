@@ -154,7 +154,7 @@ defmodule SymphonyElixir.ReviewConvergence do
     |> to_map_set()
     |> then(fn completed ->
       case history.last_completed_rework do
-        %{head_sha: ^head_sha, cluster_ids: cluster_ids} ->
+        %{cluster_ids: cluster_ids} ->
           MapSet.union(completed, MapSet.new(cluster_ids))
 
         _other ->

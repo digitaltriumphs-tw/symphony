@@ -5,13 +5,18 @@ defmodule SymphonyElixir.ReviewConvergenceLedgerTest do
 
   @cluster_a "symphony-review-finding-cluster:v1:992112030cba4e48b120c7f3add9d5af9a895d323af521366122dc2f824bec84"
   @cluster_b "symphony-review-finding-cluster:v1:ececaf5eaa388c3875f8e48d795e2fecbe7901ed0c9015c3ecde19c22c472504"
+  @operation_1 String.duplicate("1", 64)
+  @operation_2 String.duplicate("2", 64)
+  @hold_id String.duplicate("3", 64)
+  @head_1 String.duplicate("a", 40)
+  @head_2 String.duplicate("b", 64)
 
   test "canonical event encoding sorts cluster IDs and round-trips the versioned wire shape" do
     event = %{
       kind: :rework_intent,
-      operation_id: "operation-1",
+      operation_id: @operation_1,
       round: 1,
-      head_sha: "head-1",
+      head_sha: @head_1,
       target_state: "In Progress",
       cluster_ids: [@cluster_b, @cluster_a]
     }
@@ -22,9 +27,9 @@ defmodule SymphonyElixir.ReviewConvergenceLedgerTest do
     assert {:ok,
             %{
               kind: :rework_intent,
-              operation_id: "operation-1",
+              operation_id: @operation_1,
               round: 1,
-              head_sha: "head-1",
+              head_sha: @head_1,
               target_state: "In Progress",
               cluster_ids: [@cluster_a, @cluster_b]
             }} = ReviewConvergenceLedger.parse_comment("human-readable receipt\n\n#{block}")
@@ -37,9 +42,9 @@ defmodule SymphonyElixir.ReviewConvergenceLedgerTest do
       ledger_block(%{
         "schema_version" => 1,
         "event" => "rework_intent",
-        "operation_id" => "operation-1",
+        "operation_id" => @operation_1,
         "round" => 1,
-        "head_sha" => "head-1",
+        "head_sha" => @head_1,
         "target_state" => "In Progress",
         "cluster_ids" => [@cluster_a]
       })
@@ -61,22 +66,67 @@ defmodule SymphonyElixir.ReviewConvergenceLedgerTest do
 
     duplicate_key =
       "<!-- symphony-review-convergence-ledger:v1\n" <>
-        ~s|{"schema_version":1,"schema_version":1,"event":"rework_intent","operation_id":"operation-1","round":1,"head_sha":"head-1","target_state":"In Progress","cluster_ids":["#{@cluster_a}"]}| <>
+        ~s|{"schema_version":1,"schema_version":1,"event":"rework_intent","operation_id":"#{@operation_1}","round":1,"head_sha":"#{@head_1}","target_state":"In Progress","cluster_ids":["#{@cluster_a}"]}| <>
         "\n-->"
 
     assert {:error, :malformed_ledger_event} =
              ReviewConvergenceLedger.parse_comment(duplicate_key)
   end
 
+  test "transition and hold identities reject noncanonical SHA and dedup IDs" do
+    valid_transition =
+      ledger_block(%{
+        "schema_version" => 1,
+        "event" => "rework_intent",
+        "operation_id" => @operation_1,
+        "round" => 1,
+        "head_sha" => @head_1,
+        "target_state" => "In Progress",
+        "cluster_ids" => [@cluster_a]
+      })
+
+    assert {:error, :invalid_operation_id} =
+             valid_transition
+             |> String.replace(@operation_1, String.duplicate("A", 64))
+             |> ReviewConvergenceLedger.parse_comment()
+
+    assert {:error, :invalid_head_sha} =
+             valid_transition
+             |> String.replace(@head_1, String.duplicate("A", 40))
+             |> ReviewConvergenceLedger.parse_comment()
+
+    assert {:error, :invalid_head_sha} =
+             valid_transition
+             |> String.replace(@head_1, String.duplicate("a", 39))
+             |> ReviewConvergenceLedger.parse_comment()
+
+    valid_hold =
+      ledger_block(%{
+        "schema_version" => 1,
+        "event" => "convergence_hold",
+        "hold_id" => @hold_id,
+        "head_sha" => @head_2,
+        "reason" => "repeated_cluster",
+        "cluster_ids" => [@cluster_a]
+      })
+
+    assert {:error, :invalid_hold_id} =
+             valid_hold
+             |> String.replace(@hold_id, String.duplicate("3", 63))
+             |> ReviewConvergenceLedger.parse_comment()
+
+    assert {:ok, %{head_sha: @head_2}} = ReviewConvergenceLedger.parse_comment(valid_hold)
+  end
+
   test "history restores completed rounds, the last exact-head manifest, holds, and pending transitions" do
-    intent_1 = event(:rework_intent, "operation-1", 1, "head-1", [@cluster_a])
-    completed_1 = event(:rework_completed, "operation-1", 1, "head-1", [@cluster_a])
-    intent_2 = event(:rework_intent, "operation-2", 2, "head-2", [@cluster_b])
+    intent_1 = event(:rework_intent, @operation_1, 1, @head_1, [@cluster_a])
+    completed_1 = event(:rework_completed, @operation_1, 1, @head_1, [@cluster_a])
+    intent_2 = event(:rework_intent, @operation_2, 2, @head_2, [@cluster_b])
 
     hold = %{
       kind: :convergence_hold,
-      hold_id: "hold-head-2",
-      head_sha: "head-2",
+      hold_id: @hold_id,
+      head_sha: @head_2,
       reason: :repeated_cluster,
       cluster_ids: [@cluster_b]
     }
@@ -86,24 +136,24 @@ defmodule SymphonyElixir.ReviewConvergenceLedgerTest do
     assert {:ok, history} = ReviewConvergenceLedger.history(bodies)
     assert history.rework_count == 1
     assert history.last_completed_rework == completed_1
-    assert history.completed_cluster_ids_by_head == %{"head-1" => MapSet.new([@cluster_a])}
-    assert history.pending_transitions == %{"operation-2" => intent_2}
-    assert history.holds_by_head == %{"head-2" => hold}
+    assert history.completed_cluster_ids_by_head == %{@head_1 => MapSet.new([@cluster_a])}
+    assert history.pending_transitions == %{@operation_2 => intent_2}
+    assert history.holds_by_head == %{@head_2 => hold}
   end
 
   test "completion without a matching intent and contradictory manifests fail closed" do
-    completion = event(:rework_completed, "operation-1", 1, "head-1", [@cluster_a])
+    completion = event(:rework_completed, @operation_1, 1, @head_1, [@cluster_a])
 
     assert {:error, :completion_without_intent} =
              ReviewConvergenceLedger.history([encoded_comment(completion)])
 
-    intent = event(:rework_intent, "operation-1", 1, "head-1", [@cluster_a])
-    conflicting = event(:rework_completed, "operation-1", 1, "head-1", [@cluster_b])
+    intent = event(:rework_intent, @operation_1, 1, @head_1, [@cluster_a])
+    conflicting = event(:rework_completed, @operation_1, 1, @head_1, [@cluster_b])
 
     assert {:error, :completion_manifest_mismatch} =
              ReviewConvergenceLedger.history([encoded_comment(intent), encoded_comment(conflicting)])
 
-    other_intent = event(:rework_intent, "operation-2", 1, "head-2", [@cluster_b])
+    other_intent = event(:rework_intent, @operation_2, 1, @head_2, [@cluster_b])
 
     assert {:error, :duplicate_rework_round} =
              ReviewConvergenceLedger.history([encoded_comment(intent), encoded_comment(other_intent)])

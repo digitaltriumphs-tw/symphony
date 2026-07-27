@@ -56,7 +56,7 @@ defmodule SymphonyElixir.ReviewMonitor do
 
     case tracker.review_history(issue.id) do
       {:ok, history} ->
-        history = normalize_history(history)
+        history = history |> normalize_history() |> validate_recovery_history(issue, settings)
         fix_rounds = max(entry.fix_rounds, history.rework_count)
         convergence_history = Map.put(history, :rework_count, fix_rounds)
 
@@ -87,6 +87,17 @@ defmodule SymphonyElixir.ReviewMonitor do
 
           issue.state == settings.review_state ->
             reconcile_snapshot(issue, entry, state, settings, review_client, tracker)
+
+          not is_nil(history.ledger_error) ->
+            wait_for_history_error(
+              issue,
+              entry,
+              state,
+              settings,
+              review_client,
+              tracker,
+              history.ledger_error
+            )
 
           true ->
             Map.delete(state, issue.id)
@@ -498,6 +509,53 @@ defmodule SymphonyElixir.ReviewMonitor do
       move_and_complete_transition(issue, entry, tracker, intent)
     end
   end
+
+  defp validate_recovery_history(history, issue, settings) do
+    cond do
+      not is_nil(history.ledger_error) ->
+        Map.put(history, :pending_transitions, %{})
+
+      not is_map(history.pending_transitions) ->
+        invalidate_pending_transitions(history, :invalid_collection)
+
+      true ->
+        case Enum.find_value(history.pending_transitions, &invalid_pending_transition(&1, issue, settings)) do
+          nil -> history
+          reason -> invalidate_pending_transitions(history, reason)
+        end
+    end
+  end
+
+  defp invalidate_pending_transitions(history, reason) do
+    history
+    |> Map.put(:ledger_error, {:invalid_pending_transition, reason})
+    |> Map.put(:pending_transitions, %{})
+  end
+
+  defp invalid_pending_transition({operation_id, intent}, issue, settings) when is_map(intent) do
+    with {:ok, block} <- ReviewConvergenceLedger.encode(intent),
+         {:ok, ^intent} <- ReviewConvergenceLedger.parse_comment(block),
+         true <- intent.kind == :rework_intent,
+         true <- operation_id == intent.operation_id,
+         true <- intent.target_state == settings.in_progress_state,
+         expected_operation_id =
+           ReviewConvergence.dedup_key(
+             :state_transition,
+             issue.id,
+             intent.head_sha,
+             Enum.sort(intent.cluster_ids)
+           ),
+         true <- intent.operation_id == expected_operation_id do
+      false
+    else
+      {:error, reason} -> {:invalid_event, reason}
+      {:ok, _noncanonical_intent} -> :noncanonical_event
+      false -> :manifest_mismatch
+    end
+  end
+
+  defp invalid_pending_transition(_pending_transition, _issue, _settings),
+    do: :invalid_event
 
   defp move_and_complete_transition(issue, entry, tracker, intent) do
     with :ok <- tracker.update_issue_state(issue.id, intent.target_state),

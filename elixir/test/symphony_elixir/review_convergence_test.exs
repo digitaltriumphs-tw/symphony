@@ -11,6 +11,16 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
   @cluster_ac_1 "symphony-review-finding-cluster:v1:992112030cba4e48b120c7f3add9d5af9a895d323af521366122dc2f824bec84"
   @cluster_current_diff "symphony-review-finding-cluster:v1:506b3e7fedceec635a36c148ae36dfa839a445ffda1a32ecc3cc4f86a81189ba"
+  @head_sha String.duplicate("a", 40)
+  @new_head_sha String.duplicate("b", 40)
+  @operation_head_a "b2b2a24890c798fe7362f0266f77dd41494e22058102bbfdab5ba4202aa305f1"
+  @operation_head_b "91218d50cfee8c4dd0bc8a3df81a23d86e587a197c2a20e649429e048d327d9e"
+  @operation_head_c "a3ff0bf1419c11b04f71a7f8e6a9a55ff5839dc10fd2869303a6eedd35e3a1f8"
+  @forged_operation String.duplicate("f", 64)
+  @pending_operation String.duplicate("4", 64)
+  @completed_operation String.duplicate("5", 64)
+  @conflicting_operation String.duplicate("6", 64)
+  @hold_id String.duplicate("d", 64)
 
   defmodule ReviewClient do
     @spec snapshot(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
@@ -877,13 +887,13 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
   test "a persisted review-request key prevents a duplicate after monitor restart" do
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{reviewed_head_sha: nil})})
-    digest = ReviewConvergence.dedup_key(:review_request, "issue-160", "head", :codex)
-    key = "review-request:issue-160:head:#{digest}"
+    digest = ReviewConvergence.dedup_key(:review_request, "issue-160", @head_sha, :codex)
+    key = "review-request:issue-160:#{@head_sha}:#{digest}"
     Application.put_env(:symphony_elixir, :existing_review_keys, [key])
 
     _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
     refute_receive {:review_requested, _, _, _}
-    assert_receive {:status, _, "head", :pending, _}
+    assert_receive {:status, _, @head_sha, :pending, _}
   end
 
   defmodule HistoryClient do
@@ -953,9 +963,9 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     Process.put(:history_responses, [
       history_page(
         [
-          transition_intent_body("pending", head, 2, [@cluster_current_diff]),
-          transition_intent_body("completed", head, 1, [@cluster_ac_1]),
-          transition_completed_body("completed", head, 1, [@cluster_ac_1])
+          transition_intent_body(@pending_operation, head, 2, [@cluster_current_diff]),
+          transition_intent_body(@completed_operation, head, 1, [@cluster_ac_1]),
+          transition_completed_body(@completed_operation, head, 1, [@cluster_ac_1])
         ],
         false,
         nil
@@ -972,9 +982,9 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
              Adapter.review_history("issue-160")
 
     assert pending == %{
-             "pending" => %{
+             @pending_operation => %{
                kind: :rework_intent,
-               operation_id: "pending",
+               operation_id: @pending_operation,
                round: 2,
                head_sha: head,
                target_state: "In Progress",
@@ -982,7 +992,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
              }
            }
 
-    assert completed == completed_rework("completed", 1, head, [@cluster_ac_1])
+    assert completed == completed_rework(@completed_operation, 1, head, [@cluster_ac_1])
     assert completed_by_head == %{head => MapSet.new([@cluster_ac_1])}
   end
 
@@ -1015,8 +1025,8 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     Process.put(:history_responses, [
       history_page(
         [
-          transition_intent_body("conflict", intent_head, 1, [@cluster_ac_1]),
-          transition_completed_body("conflict", conflicting_head, 1, [@cluster_ac_1])
+          transition_intent_body(@conflicting_operation, intent_head, 1, [@cluster_ac_1]),
+          transition_completed_body(@conflicting_operation, conflicting_head, 1, [@cluster_ac_1])
         ],
         false,
         nil
@@ -1085,8 +1095,8 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       "issue-160" => %{
         dedup: MapSet.new(),
         fix_rounds: 0,
-        head_sha: "head",
-        last_published_status: {"head", :success},
+        head_sha: @head_sha,
+        last_published_status: {@head_sha, :success},
         review_requested: false,
         waiting: false,
         last_finding_fingerprint: nil
@@ -1094,25 +1104,25 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     }
 
     state = ReviewMonitor.run_with(entry, settings(), ReviewClient, FailingIssueTracker)
-    assert_receive {:status, _, "head", :error, _}
+    assert_receive {:status, _, @head_sha, :error, _}
 
     state = ReviewMonitor.run_with(state, settings(), ReviewClient, FailingIssueTracker)
     refute_receive {:status, _, _, _, _}
 
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot()})
     _state = ReviewMonitor.run_with(state, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :success, _}
+    assert_receive {:status, _, @head_sha, :success, _}
   end
 
   test "convergence republishes success after a transient error while keeping its comment deduplicated" do
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot()})
-    key = ReviewConvergence.dedup_key(:converged, "issue-160", "head", :technical)
+    key = ReviewConvergence.dedup_key(:converged, "issue-160", @head_sha, :technical)
 
     entry = %{
       "issue-160" => %{
         dedup: MapSet.new([key]),
         fix_rounds: 0,
-        head_sha: "head",
+        head_sha: @head_sha,
         review_requested: false,
         waiting: true,
         last_finding_fingerprint: nil
@@ -1120,7 +1130,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     }
 
     _state = ReviewMonitor.run_with(entry, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :success, _}
+    assert_receive {:status, _, @head_sha, :success, _}
     refute_receive {:comment, _, _}
   end
 
@@ -1128,21 +1138,21 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot()})
 
     state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :success, _}
+    assert_receive {:status, _, @head_sha, :success, _}
 
     _state = ReviewMonitor.run_with(state, settings(), ReviewClient, Tracker)
-    refute_receive {:status, _, "head", :success, _}
+    refute_receive {:status, _, @head_sha, :success, _}
   end
 
   test "previously deduplicated wait still replaces a later success when evidence regresses" do
-    wait_key = ReviewConvergence.dedup_key(:wait, "issue-160", "head", :required_checks_not_passed)
+    wait_key = ReviewConvergence.dedup_key(:wait, "issue-160", @head_sha, :required_checks_not_passed)
 
     entry = %{
       "issue-160" => %{
         dedup: MapSet.new([wait_key]),
         fix_rounds: 0,
-        head_sha: "head",
-        last_published_status: {"head", :success},
+        head_sha: @head_sha,
+        last_published_status: {@head_sha, :success},
         review_requested: false,
         waiting: false,
         last_finding_fingerprint: nil
@@ -1156,7 +1166,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     )
 
     _state = ReviewMonitor.run_with(entry, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :pending, _}
+    assert_receive {:status, _, @head_sha, :pending, _}
     refute_receive {:comment, _, _}
   end
 
@@ -1255,8 +1265,8 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     history =
       empty_convergence_history(%{
         rework_count: 1,
-        last_completed_rework: completed_rework("operation-1", 1, "head", [@cluster_ac_1]),
-        completed_cluster_ids_by_head: %{"head" => MapSet.new([@cluster_ac_1])}
+        last_completed_rework: completed_rework(@operation_head_a, 1, @head_sha, [@cluster_ac_1]),
+        completed_cluster_ids_by_head: %{@head_sha => MapSet.new([@cluster_ac_1])}
       })
 
     assert {:convergence_hold,
@@ -1269,18 +1279,28 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
              |> ReviewConvergence.evaluate(history, 3)
   end
 
-  test "the same cluster on a new head may consume the next existing fix-round budget slot" do
+  test "a previous completed cluster holds the whole mixed finding set on a new head" do
     history =
       empty_convergence_history(%{
         rework_count: 1,
-        last_completed_rework: completed_rework("operation-1", 1, "head", [@cluster_ac_1]),
-        completed_cluster_ids_by_head: %{"head" => MapSet.new([@cluster_ac_1])}
+        last_completed_rework: completed_rework(@operation_head_a, 1, @head_sha, [@cluster_ac_1]),
+        completed_cluster_ids_by_head: %{@head_sha => MapSet.new([@cluster_ac_1])}
       })
 
-    finding = same_pr_finding_for_head("new-head")
-
-    assert {:rework, %{cluster_ids: [@cluster_ac_1], next_round: 2}} =
-             snapshot(%{current_head_sha: "new-head", threads: [finding]})
+    assert {:convergence_hold,
+            %{
+              reason: :repeated_cluster,
+              cluster_ids: [@cluster_current_diff, @cluster_ac_1],
+              repeated_cluster_ids: [@cluster_ac_1]
+            }} =
+             snapshot(%{
+               current_head_sha: @new_head_sha,
+               reviewed_head_sha: @new_head_sha,
+               threads: [
+                 same_pr_finding_for_head(@new_head_sha),
+                 current_diff_finding(@new_head_sha)
+               ]
+             })
              |> ReviewConvergence.evaluate(history, 3)
   end
 
@@ -1304,13 +1324,13 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
     persisted_hold = %{
       kind: :convergence_hold,
-      hold_id: "hold-head",
-      head_sha: "head",
+      hold_id: @hold_id,
+      head_sha: @head_sha,
       reason: :repeated_cluster,
       cluster_ids: [@cluster_ac_1]
     }
 
-    held = empty_convergence_history(%{holds_by_head: %{"head" => persisted_hold}})
+    held = empty_convergence_history(%{holds_by_head: %{@head_sha => persisted_hold}})
 
     assert {:convergence_hold, %{reason: :persisted_convergence_hold, persisted_hold: ^persisted_hold}} =
              snapshot() |> ReviewConvergence.evaluate(held, 3)
@@ -1359,7 +1379,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
 
     state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :failure, _}
+    assert_receive {:status, _, @head_sha, :failure, _}
     assert_receive {:comment, "issue-160", body}
     assert body =~ "P1"
     assert_receive {:comment, "issue-160", intent_body}
@@ -1367,7 +1387,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert {:ok, intent_event} = ReviewConvergenceLedger.parse_comment(intent_body)
     assert intent_event.kind == :rework_intent
     assert intent_event.round == 1
-    assert intent_event.head_sha == "head"
+    assert intent_event.head_sha == @head_sha
     assert intent_event.cluster_ids == [@cluster_ac_1]
     assert_receive {:state, "issue-160", "In Progress"}
     assert_receive {:comment, "issue-160", transition_body}
@@ -1384,13 +1404,13 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "a repeated exact-head cluster writes one durable Convergence Hold and never moves state or rereviews" do
-    completed = completed_rework("operation-1", 1, "head", [@cluster_ac_1])
+    completed = completed_rework(@operation_head_a, 1, @head_sha, [@cluster_ac_1])
 
     history =
       empty_convergence_history(%{
         rework_count: 1,
         last_completed_rework: completed,
-        completed_cluster_ids_by_head: %{"head" => MapSet.new([@cluster_ac_1])}
+        completed_cluster_ids_by_head: %{@head_sha => MapSet.new([@cluster_ac_1])}
       })
 
     Application.put_env(:symphony_elixir, :review_history, {:ok, history})
@@ -1398,13 +1418,13 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
     state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
 
-    assert_receive {:status, _, "head", :failure, _}
+    assert_receive {:status, _, @head_sha, :failure, _}
     assert_receive {:comment, "issue-160", hold_comment}
     assert hold_comment =~ "Convergence Hold"
     assert hold_comment =~ "repeated_cluster"
     assert {:ok, hold_event} = ReviewConvergenceLedger.parse_comment(hold_comment)
     assert hold_event.kind == :convergence_hold
-    assert hold_event.head_sha == "head"
+    assert hold_event.head_sha == @head_sha
     assert hold_event.cluster_ids == [@cluster_ac_1]
     refute_receive {:state, _, _}
     refute_receive {:review_requested, _, _, _}
@@ -1413,12 +1433,12 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     restarted_history =
       history
       |> Map.put(:dedup, MapSet.new([hold_event.hold_id]))
-      |> Map.put(:holds_by_head, %{"head" => hold_event})
+      |> Map.put(:holds_by_head, %{@head_sha => hold_event})
 
     Application.put_env(:symphony_elixir, :review_history, {:ok, restarted_history})
 
     _restarted = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :failure, _}
+    assert_receive {:status, _, @head_sha, :failure, _}
     refute_receive {:comment, _, _}
     refute_receive {:state, _, _}
     refute_receive {:review_requested, _, _, _}
@@ -1431,7 +1451,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
     _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
 
-    assert_receive {:status, _, "head", :failure, _}
+    assert_receive {:status, _, @head_sha, :failure, _}
     assert_receive {:comment, "issue-160", hold_comment}
     assert hold_comment =~ "Convergence Hold"
     assert hold_comment =~ "invalid_ledger"
@@ -1449,7 +1469,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
     state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
 
-    assert_receive {:status, _, "head", :pending, _}
+    assert_receive {:status, _, @head_sha, :pending, _}
     assert_receive {:comment, "issue-160", comment}
     assert comment =~ "held review findings"
     assert comment =~ "missing_disposition"
@@ -1470,7 +1490,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [first]})})
 
     first_state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :pending, _}
+    assert_receive {:status, _, @head_sha, :pending, _}
     assert_receive {:comment, "issue-160", _comment}
 
     Application.put_env(
@@ -1483,7 +1503,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [rewritten]})})
 
     restarted = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :pending, _}
+    assert_receive {:status, _, @head_sha, :pending, _}
     refute_receive {:comment, _, _}
     refute_receive {:review_requested, _, _, _}
     refute_receive {:state, _, _}
@@ -1502,7 +1522,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
     state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
 
-    assert_receive {:status, _, "head", :failure, _}
+    assert_receive {:status, _, @head_sha, :failure, _}
     assert_receive {:comment, "issue-160", held_comment}
     assert held_comment =~ "held review findings"
     assert held_comment =~ "https://example.test/held"
@@ -1528,7 +1548,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   test "state transition retries after the rework comment already persisted" do
     finding = same_pr_finding(%{body: "P1 state retry", url: "thread"})
     fingerprint = [@cluster_ac_1]
-    key = ReviewConvergence.dedup_key(:rework, "issue-160", "head", fingerprint)
+    key = ReviewConvergence.dedup_key(:rework, "issue-160", @head_sha, fingerprint)
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
     Application.put_env(:symphony_elixir, :review_state_result, {:error, :linear_unavailable})
 
@@ -1574,7 +1594,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
         dedup: MapSet.new([key, transition_key]),
         rework_count: 1,
         last_completed_rework: resumed_completion,
-        completed_cluster_ids_by_head: %{"head" => MapSet.new([@cluster_ac_1])}
+        completed_cluster_ids_by_head: %{@head_sha => MapSet.new([@cluster_ac_1])}
       })
     })
 
@@ -1600,7 +1620,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "pending transition completes after restart even after the issue left review" do
-    operation_id = "durable-operation"
+    operation_id = @operation_head_a
 
     Application.put_env(:symphony_elixir, :review_issues, [
       %{issue() | state: "In Progress"}
@@ -1618,7 +1638,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
              kind: :rework_intent,
              operation_id: operation_id,
              round: 1,
-             head_sha: String.duplicate("a", 40),
+             head_sha: @head_sha,
              target_state: "In Progress",
              cluster_ids: [@cluster_ac_1]
            }
@@ -1641,7 +1661,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "pending transition retries the state move before recording completion" do
-    operation_id = "retry-operation"
+    operation_id = @operation_head_b
 
     Application.put_env(
       :symphony_elixir,
@@ -1655,7 +1675,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
              kind: :rework_intent,
              operation_id: operation_id,
              round: 1,
-             head_sha: String.duplicate("b", 40),
+             head_sha: @new_head_sha,
              target_state: "In Progress",
              cluster_ids: [@cluster_ac_1]
            }
@@ -1676,7 +1696,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "stale pending history does not recount an already deduplicated completion" do
-    operation_id = "already-completed-operation"
+    operation_id = @operation_head_c
 
     Application.put_env(:symphony_elixir, :review_issues, [
       %{issue() | state: "In Progress"}
@@ -1709,6 +1729,64 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert state["issue-160"].fix_rounds == 1
   end
 
+  test "pending recovery rejects a forged target state without moving the issue" do
+    Application.put_env(
+      :symphony_elixir,
+      :review_history,
+      {:ok,
+       empty_convergence_history(%{
+         pending_transitions: %{
+           @operation_head_a => %{
+             kind: :rework_intent,
+             operation_id: @operation_head_a,
+             round: 1,
+             head_sha: @head_sha,
+             target_state: "Done",
+             cluster_ids: [@cluster_ac_1]
+           }
+         }
+       })}
+    )
+
+    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot()})
+
+    _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+
+    assert_receive {:comment, "issue-160", hold_comment}
+    assert hold_comment =~ "invalid_ledger"
+    refute_receive {:state, _, _}
+    refute_receive {:review_requested, _, _, _}
+  end
+
+  test "pending recovery rejects a syntactically valid forged operation without moving the issue" do
+    Application.put_env(
+      :symphony_elixir,
+      :review_history,
+      {:ok,
+       empty_convergence_history(%{
+         pending_transitions: %{
+           @forged_operation => %{
+             kind: :rework_intent,
+             operation_id: @forged_operation,
+             round: 1,
+             head_sha: @head_sha,
+             target_state: "In Progress",
+             cluster_ids: [@cluster_ac_1]
+           }
+         }
+       })}
+    )
+
+    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot()})
+
+    _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+
+    assert_receive {:comment, "issue-160", hold_comment}
+    assert hold_comment =~ "invalid_ledger"
+    refute_receive {:state, _, _}
+    refute_receive {:review_requested, _, _, _}
+  end
+
   test "ordinary In Progress issue ignores review-history outages" do
     Application.put_env(:symphony_elixir, :review_issues, [
       %{issue() | state: "In Progress"}
@@ -1734,7 +1812,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       "issue-160" => %{
         dedup: MapSet.new(),
         fix_rounds: 0,
-        head_sha: "head",
+        head_sha: @head_sha,
         fetch_failed: false,
         waiting: false,
         review_requested: false,
@@ -1744,7 +1822,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     }
 
     result = ReviewMonitor.run_with(state, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :error, _}
+    assert_receive {:status, _, @head_sha, :error, _}
     assert_receive {:comment, "issue-160", body}
     assert body =~ "linear_unavailable"
     assert result["issue-160"].waiting
@@ -1758,7 +1836,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     )
 
     state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :pending, _}
+    assert_receive {:status, _, @head_sha, :pending, _}
     assert_receive {:comment, "issue-160", body}
     assert body =~ "waiting for team human judgment"
     assert body =~ "staging"
@@ -1771,12 +1849,12 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "exhausted typed fix-round budget creates a Convergence Hold instead of scheduling repair" do
-    finding = same_pr_finding_for_head("new-head")
+    finding = same_pr_finding_for_head(@new_head_sha)
 
     Application.put_env(
       :symphony_elixir,
       :review_snapshot,
-      {:ok, snapshot(%{current_head_sha: "new-head", threads: [finding]})}
+      {:ok, snapshot(%{current_head_sha: @new_head_sha, threads: [finding]})}
     )
 
     Application.put_env(
@@ -1786,7 +1864,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     )
 
     _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "new-head", :failure, _}
+    assert_receive {:status, _, @new_head_sha, :failure, _}
     assert_receive {:comment, "issue-160", body}
     assert body =~ "Convergence Hold"
     assert body =~ "fix_round_budget_exhausted"
@@ -1817,7 +1895,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot()})
 
     _state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
-    assert_receive {:status, _, "head", :error, _}
+    assert_receive {:status, _, @head_sha, :error, _}
     assert_receive {:comment, "issue-160", body}
     assert body =~ "linear_unavailable"
     refute_receive {:state, _, _}
@@ -1923,7 +2001,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       "kind" => "same_pr",
       "binding" => %{
         "base_sha" => "base",
-        "head_sha" => "head",
+        "head_sha" => @head_sha,
         "path" => "lib/example.ex"
       },
       "scope_ref" => %{"type" => "acceptance_criterion", "id" => "AC-1"}
@@ -1938,7 +2016,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
         body: "P1 verified same-PR finding",
         path: "lib/example.ex",
         url: "https://example.test/same-pr",
-        commit_sha: "head",
+        commit_sha: @head_sha,
         thread_id: "thread-same",
         finding_comment_id: "comment-same",
         disposition_actor: trusted_actor(),
@@ -1953,13 +2031,13 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     same_pr_finding(%{disposition: {:decoded, payload}, commit_sha: head_sha})
   end
 
-  defp current_diff_finding do
+  defp current_diff_finding(head_sha \\ @head_sha) do
     payload = %{
       "schema_version" => 1,
       "kind" => "introduced_by_pr",
       "binding" => %{
         "base_sha" => "base",
-        "head_sha" => "head",
+        "head_sha" => head_sha,
         "path" => "lib/current.ex"
       },
       "proof" => %{"type" => "current_pr_diff"}
@@ -1967,6 +2045,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
     same_pr_finding(%{
       path: "lib/current.ex",
+      commit_sha: head_sha,
       thread_id: "thread-current-diff",
       finding_comment_id: "comment-current-diff",
       disposition: {:decoded, payload}
@@ -1981,7 +2060,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
         body: "P1 finding without disposition metadata",
         path: "lib/held.ex",
         url: "https://example.test/held",
-        commit_sha: "head",
+        commit_sha: @head_sha,
         thread_id: "thread-held",
         finding_comment_id: "comment-held",
         disposition_actor: trusted_actor(),
@@ -2024,8 +2103,8 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       %{
         repository: "aroakpm-svg/repo",
         pull_request_number: 42,
-        current_head_sha: "head",
-        reviewed_head_sha: "head",
+        current_head_sha: @head_sha,
+        reviewed_head_sha: @head_sha,
         review_result: :no_major_issues,
         base_ref_oid: "base",
         base_verification_required: false,
