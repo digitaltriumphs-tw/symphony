@@ -355,6 +355,32 @@ operations MUST remain recoverable after restart and after the issue leaves the 
 round MUST be counted only once the target state is observed and completion is durable.
 Technical convergence MUST NOT authorize merge, deployment, or terminal tracker transitions.
 
+The implementation extension parses the PR body once into a typed `ScopeContract` result and
+normalizes each actionable finding from one exact GitHub review comment node: thread id, comment
+id, immutable actor identity, body, path, URL, and commit. The same comment MUST contain exactly one
+metadata block outside Markdown fences:
+
+```text
+<!-- symphony-finding-disposition:v1
+{"schema_version":1,"kind":"same_pr","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"},"scope_ref":{"type":"acceptance_criterion","id":"AC-1"}}
+-->
+```
+
+The allowlisted reviewer identity, schema version, exact base/head/path binding, exact allowed
+fields, and kind-specific evidence MUST all verify. `same_pr` references an exact Scope Contract
+acceptance criterion or invariant; `introduced_by_pr` supplies exact current-diff proof;
+`prerequisite` references an exact dependency; `follow_up` declares `adjacent` or `pre_existing`;
+and `human_hold` explicitly requests human disposition. Missing, malformed, duplicate, oversized,
+untrusted, stale, unknown, or contract-invalid evidence MUST fail closed.
+
+Only verified `same_pr` work (including verified `introduced_by_pr`) may trigger rework. All other
+routes remain In Review. Hold-only findings MUST NOT request another review, change tracker state,
+or consume a fix round. For mixed findings, held evidence MUST be persisted separately before the
+verified same-PR transition. Rework and hold deduplication MUST use the sorted stable identity tuple
+`{thread_id, finding_comment_id, route, evidence_code}`, never mutable prose. The retry limit applies
+only to verified same-PR transitions. This v1 does not add readiness evaluation, finding clustering
+or budgets, ruleset or merge authorization, or metrics.
+
 Note:
 
 - The workflow front matter is extensible. Extensions MAY define additional top-level keys without
@@ -536,10 +562,11 @@ or placeholder fields without inferring meaning from free-form prose.
   whether a finding belongs to the current pull request.
 - This contract defines and statically validates the pull-request boundary only. It MUST NOT
   classify findings, move tracker issues, or otherwise change review-routing state.
-- A later routing policy MAY consume the typed contract, but that policy is a separate extension.
-  It MAY return a finding to the same pull request only after proving that the finding violates a
-  declared invariant or acceptance criterion, or that the pull request introduced the defect.
-- If ownership cannot be established, the later policy MUST fail closed: keep the issue in review
+- The review-convergence routing extension MAY consume the typed contract, but remains separate
+  from static lint. It MAY return a finding to the same pull request only after proving that the
+  finding violates a declared invariant or acceptance criterion, or that the pull request
+  introduced the defect.
+- If ownership cannot be established, the routing policy MUST fail closed: keep the issue in review
   for follow-up or human disposition rather than returning it to the pull request.
 - When this lint applies to an existing pull request, its description MUST be migrated to the
   structured contract before it can pass validation.

@@ -1,11 +1,14 @@
 defmodule SymphonyElixir.GitHubReviewClient do
   @moduledoc "Reads latest-head review evidence and requests Codex reviews through `gh`."
 
+  alias SymphonyElixir.{FindingRouter, ScopeContract}
+
   @graphql """
   query SymphonyReviewConvergence($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
     repository(owner: $owner, name: $name) {
       pullRequest(number: $number) {
         number
+        body
         headRefOid
         baseRefName
         baseRefOid
@@ -28,7 +31,20 @@ defmodule SymphonyElixir.GitHubReviewClient do
             isResolved
             id
             comments(first: 100) {
-              nodes { body path url commit { oid } }
+              nodes {
+                id
+                body
+                path
+                url
+                commit { oid }
+                author {
+                  login
+                  __typename
+                  ... on Organization { databaseId }
+                  ... on Bot { databaseId }
+                  ... on User { databaseId }
+                }
+              }
             }
           }
           pageInfo { hasNextPage endCursor }
@@ -43,7 +59,20 @@ defmodule SymphonyElixir.GitHubReviewClient do
     node(id: $threadId) {
       ... on PullRequestReviewThread {
         comments(first: 100, after: $endCursor) {
-          nodes { body path url commit { oid } }
+          nodes {
+            id
+            body
+            path
+            url
+            commit { oid }
+            author {
+              login
+              __typename
+              ... on Organization { databaseId }
+              ... on Bot { databaseId }
+              ... on User { databaseId }
+            }
+          }
           pageInfo { hasNextPage endCursor }
         }
       }
@@ -80,7 +109,7 @@ defmodule SymphonyElixir.GitHubReviewClient do
 
   @spec request_review(String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
   def request_review(repository, number, key) do
-    body = "@codex review\n\ndedup-key: `#{key}`"
+    body = review_request_body(key)
 
     case run(["pr", "comment", Integer.to_string(number), "--repo", repository, "--body", body]) do
       {:ok, _output} -> :ok
@@ -196,12 +225,12 @@ defmodule SymphonyElixir.GitHubReviewClient do
     do: normalize_snapshot(pull_request, checks, base_verification, issue_comments)
 
   @doc false
-  @spec base_missing_paths_for_test([map()], String.t()) :: [String.t()]
-  def base_missing_paths_for_test(threads, head_sha), do: base_missing_paths(threads, head_sha)
+  @spec review_request_body_for_test(String.t()) :: String.t()
+  def review_request_body_for_test(key), do: review_request_body(key)
 
   @doc false
-  @spec structural_risk_for_test?([map()], String.t()) :: boolean()
-  def structural_risk_for_test?(threads, head_sha), do: structural_risk?(threads, head_sha)
+  @spec base_missing_paths_for_test([map()], String.t()) :: [String.t()]
+  def base_missing_paths_for_test(threads, head_sha), do: base_missing_paths(threads, head_sha)
 
   @doc false
   @spec normalize_branch_protection_response_for_test(String.t(), integer()) ::
@@ -226,6 +255,32 @@ defmodule SymphonyElixir.GitHubReviewClient do
   @doc false
   @spec encode_path_segment_for_test(String.t()) :: String.t()
   def encode_path_segment_for_test(value), do: encode_path_segment(value)
+
+  defp review_request_body(key) do
+    """
+    @codex review
+
+    For every actionable P1-P4 finding, append exactly one disposition block to that same finding comment. Severity P1-P4 indicates actionability, not scope ownership. Do not put disposition metadata in a separate comment and do not infer any field from prose.
+
+    Use exactly one v1 shape, with the PR's exact base SHA, head SHA, and finding path:
+
+    <!-- symphony-finding-disposition:v1
+    {"schema_version":1,"kind":"same_pr","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"},"scope_ref":{"type":"acceptance_criterion","id":"AC-1"}}
+    -->
+
+    The only other exact payload shapes allowed between those same sentinel lines are:
+
+    - `{"schema_version":1,"kind":"same_pr","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"},"scope_ref":{"type":"invariant","value":"<exact Scope Contract invariant>"}}`
+    - `{"schema_version":1,"kind":"introduced_by_pr","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"},"proof":{"type":"current_pr_diff"}}`
+    - `{"schema_version":1,"kind":"prerequisite","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"},"scope_ref":{"type":"dependency","value":"<exact Scope Contract dependency>"}}`
+    - `{"schema_version":1,"kind":"follow_up","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"},"relation":"adjacent"}` or the same object with `"relation":"pre_existing"`.
+    - `{"schema_version":1,"kind":"human_hold","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"}}`
+
+    Unknown, duplicate, missing, stale, or untrusted metadata fails closed to human hold.
+
+    dedup-key: `#{key}`
+    """
+  end
 
   defp find_pull_request(repository, branch) do
     args = [
@@ -787,7 +842,6 @@ defmodule SymphonyElixir.GitHubReviewClient do
   defp normalize_snapshot(pull_request, checks, base_verification, issue_comments) do
     head_sha = pull_request["headRefOid"]
     threads = get_in(pull_request, ["reviewThreads", "nodes"]) || []
-    current_threads = current_head_threads(pull_request)
     reviews = get_in(pull_request, ["reviews", "nodes"]) || []
     trusted_current_head_reviews = trusted_current_head_reviews(reviews, head_sha)
     accepted_review = latest_accepted_review(reviews, head_sha)
@@ -807,9 +861,9 @@ defmodule SymphonyElixir.GitHubReviewClient do
       base_ref_oid: pull_request["baseRefOid"],
       base_verification_required: base_verification.required,
       base_verification: base_verification.result,
+      scope_contract: ScopeContract.parse_pr_body(pull_request["body"] || ""),
       required_checks: checks,
-      threads: normalize_threads(threads, head_sha),
-      structural_risk: structural_risk?(current_threads, head_sha)
+      threads: normalize_threads(threads, head_sha)
     }
   end
 
@@ -926,6 +980,10 @@ defmodule SymphonyElixir.GitHubReviewClient do
 
         [
           %{
+            thread_id: thread["id"],
+            finding_comment_id: comment["id"],
+            disposition_actor: comment["author"],
+            disposition: FindingRouter.extract_disposition(body),
             resolved: thread["isResolved"] == true,
             priority: priority(body),
             body: body,
@@ -940,30 +998,11 @@ defmodule SymphonyElixir.GitHubReviewClient do
     end)
   end
 
-  defp current_head_threads(pull_request) do
-    head_sha = pull_request["headRefOid"]
-
-    (get_in(pull_request, ["reviewThreads", "nodes"]) || [])
-    |> Enum.filter(fn thread ->
-      (get_in(thread, ["comments", "nodes"]) || [])
-      |> Enum.any?(&(get_in(&1, ["commit", "oid"]) == head_sha))
-    end)
-  end
-
   defp priority(body) do
     case Regex.run(~r/\bP([1-4])\b/i, body, capture: :all_but_first) do
       [priority] -> String.to_integer(priority)
       _ -> nil
     end
-  end
-
-  defp structural_risk?(threads, head_sha) do
-    threads
-    |> Enum.reject(&(&1["isResolved"] == true))
-    |> current_head_comments(head_sha)
-    |> Enum.any?(fn comment ->
-      Regex.match?(~r/one[- ]off patch|scope (?:keeps )?(?:expanding|growth)|spec(?:ification)? conflict/i, comment["body"] || "")
-    end)
   end
 
   defp normalize_check_state(value) when is_binary(value) do

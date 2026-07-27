@@ -6,6 +6,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   alias SymphonyElixir.Linear.{Adapter, Issue}
   alias SymphonyElixir.ReviewConvergence
   alias SymphonyElixir.ReviewMonitor
+  alias SymphonyElixir.ScopeContract
 
   defmodule ReviewClient do
     @spec snapshot(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
@@ -584,8 +585,132 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     query = GitHubReviewClient.pull_request_query_for_test()
 
     assert length(Regex.scan(~r/pageInfo \{ hasNextPage endCursor \}/, query)) == 1
+    assert Regex.match?(~r/pullRequest\(number: \$number\) \{\s+number\s+body/, query)
     assert query =~ "reviewThreads(first: 100, after: $endCursor)"
     assert query =~ "comments(first: 100)"
+    assert Regex.match?(~r/nodes \{\s+id\s+body\s+path\s+url\s+commit \{ oid \}/, query)
+    assert query =~ "author {"
+    assert query =~ "databaseId"
+  end
+
+  test "review request gives Codex the exact v1 disposition contract without treating severity as ownership" do
+    body = GitHubReviewClient.review_request_body_for_test("review-key")
+
+    assert body =~ "@codex review"
+    assert body =~ "Severity P1-P4 indicates actionability, not scope ownership."
+
+    assert body =~ """
+           <!-- symphony-finding-disposition:v1
+           {"schema_version":1,"kind":"same_pr","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"},"scope_ref":{"type":"acceptance_criterion","id":"AC-1"}}
+           -->
+           """
+
+    assert body =~
+             ~s|{"schema_version":1,"kind":"introduced_by_pr","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"},"proof":{"type":"current_pr_diff"}}|
+
+    assert body =~
+             ~s|{"schema_version":1,"kind":"human_hold","binding":{"base_sha":"<base_sha>","head_sha":"<head_sha>","path":"<finding_path>"}}|
+
+    assert body =~ "dedup-key: `review-key`"
+  end
+
+  test "selected finding metadata is normalized from one exact GitHub comment node" do
+    trusted_actor = %{
+      "login" => "chatgpt-codex-connector[bot]",
+      "__typename" => "Bot",
+      "databaseId" => 199_175_422
+    }
+
+    disposition = """
+    P2 exact finding
+    <!-- symphony-finding-disposition:v1
+    {"schema_version":1,"kind":"same_pr","binding":{"base_sha":"base","head_sha":"head","path":"lib/current.ex"},"scope_ref":{"type":"acceptance_criterion","id":"AC-1"}}
+    -->
+    """
+
+    thread = %{
+      "id" => "thread-42",
+      "isResolved" => false,
+      "comments" => %{
+        "nodes" => [
+          %{
+            "id" => "comment-42",
+            "body" => disposition,
+            "path" => "lib/current.ex",
+            "url" => "https://example.test/comment-42",
+            "commit" => %{"oid" => "head"},
+            "author" => trusted_actor
+          }
+        ]
+      }
+    }
+
+    assert [
+             %{
+               thread_id: "thread-42",
+               finding_comment_id: "comment-42",
+               disposition_actor: ^trusted_actor,
+               disposition: {:decoded, %{"kind" => "same_pr"}},
+               body: ^disposition,
+               path: "lib/current.ex",
+               url: "https://example.test/comment-42",
+               commit_sha: "head",
+               priority: 2
+             }
+           ] = GitHubReviewClient.normalize_threads_for_test([thread], "head")
+  end
+
+  test "finding normalization never borrows disposition or actor evidence from another comment" do
+    trusted_body = """
+    P2 older finding
+    <!-- symphony-finding-disposition:v1
+    {"schema_version":1,"kind":"same_pr","binding":{"base_sha":"base","head_sha":"old","path":"lib/old.ex"},"scope_ref":{"type":"acceptance_criterion","id":"AC-1"}}
+    -->
+    """
+
+    selected_actor = %{"login" => "human-reviewer", "__typename" => "User", "databaseId" => 77}
+
+    thread = %{
+      "id" => "thread-selected",
+      "isResolved" => false,
+      "comments" => %{
+        "nodes" => [
+          %{
+            "id" => "comment-old",
+            "body" => trusted_body,
+            "path" => "lib/old.ex",
+            "url" => "old-url",
+            "commit" => %{"oid" => "old"},
+            "author" => %{
+              "login" => "chatgpt-codex-connector[bot]",
+              "__typename" => "Bot",
+              "databaseId" => 199_175_422
+            }
+          },
+          %{
+            "id" => "comment-selected",
+            "body" => "P1 selected finding without metadata",
+            "path" => "lib/selected.ex",
+            "url" => "selected-url",
+            "commit" => %{"oid" => "head"},
+            "author" => selected_actor
+          }
+        ]
+      }
+    }
+
+    assert [
+             %{
+               thread_id: "thread-selected",
+               finding_comment_id: "comment-selected",
+               disposition_actor: ^selected_actor,
+               disposition: :missing,
+               body: "P1 selected finding without metadata",
+               path: "lib/selected.ex",
+               url: "selected-url",
+               commit_sha: "head"
+             }
+           ] = GitHubReviewClient.normalize_threads_for_test([thread], "head")
   end
 
   test "unresolved actionable threads remain blocking across head changes" do
@@ -612,6 +737,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
   test "snapshot keeps unresolved actionable threads from prior heads" do
     pull_request = %{
+      "body" => scope_contract_body(),
       "headRefOid" => "new",
       "baseRefOid" => "base",
       "reviews" => %{"nodes" => []},
@@ -643,6 +769,8 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
       )
 
     assert [%{body: "P1 unresolved on prior head", commit_sha: "old"}] = snapshot.threads
+    assert {:ok, %ScopeContract{work_item: "Route verified review findings."}} = snapshot.scope_contract
+    refute Map.has_key?(snapshot, :structural_risk)
   end
 
   test "a conflicting trusted formal review blocks comment-attestation fallback" do
@@ -715,28 +843,6 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
 
     current = put_in(thread, ["comments", "nodes", Access.at(1), "body"], "Base ref is missing `lib/current.ex`")
     assert GitHubReviewClient.base_missing_paths_for_test([current], "head") == ["lib/current.ex"]
-  end
-
-  test "structural risk only uses unresolved current-head comments" do
-    thread = fn resolved, commit, body ->
-      %{
-        "isResolved" => resolved,
-        "comments" => %{"nodes" => [%{"body" => body, "commit" => %{"oid" => commit}}]}
-      }
-    end
-
-    refute GitHubReviewClient.structural_risk_for_test?(
-             [
-               thread.(false, "old", "P2 spec conflict"),
-               thread.(true, "head", "P2 scope keeps expanding")
-             ],
-             "head"
-           )
-
-    assert GitHubReviewClient.structural_risk_for_test?(
-             [thread.(false, "head", "P2 one-off patch")],
-             "head"
-           )
   end
 
   test "review thread comments are merged across every comment page" do
@@ -1059,8 +1165,8 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
              snapshot(%{required_checks: [%{name: "test", state: :pending}]})
              |> ReviewConvergence.evaluate(0, 3)
 
-    assert {:rework, %{actionable_threads: [_]}} =
-             snapshot(%{threads: [%{resolved: false, priority: 2, body: "P2", url: "url"}]})
+    assert {:rework, %{same_pr_findings: [%{route: :same_pr}], held_findings: []}} =
+             snapshot(%{threads: [same_pr_finding()]})
              |> ReviewConvergence.evaluate(0, 3)
   end
 
@@ -1077,11 +1183,64 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     refute ReviewConvergence.actionable_thread?(:malformed)
   end
 
-  test "structural risk escalates actionable findings before the retry limit" do
-    assert {:escalate, %{reason: :review_not_converging}} =
+  test "missing metadata is held even at the same-PR retry limit" do
+    assert {:hold,
+            %{
+              same_pr_findings: [],
+              held_findings: [%{route: :human_hold, evidence_code: :missing_disposition}]
+            }} =
+             snapshot(%{threads: [held_finding()]})
+             |> ReviewConvergence.evaluate(3, 3)
+  end
+
+  test "untrusted and stale dispositions fail closed while a verified same-PR finding remains repairable" do
+    untrusted =
+      same_pr_finding(%{
+        thread_id: "thread-untrusted",
+        finding_comment_id: "comment-untrusted",
+        disposition_actor: %{
+          "login" => "human-reviewer",
+          "__typename" => "User",
+          "databaseId" => 77
+        }
+      })
+
+    stale_payload =
+      same_pr_payload()
+      |> put_in(["binding", "head_sha"], "stale-head")
+
+    stale =
+      same_pr_finding(%{
+        thread_id: "thread-stale",
+        finding_comment_id: "comment-stale",
+        disposition: {:decoded, stale_payload}
+      })
+
+    assert {:rework,
+            %{
+              same_pr_findings: [%{thread_id: "thread-same", route: :same_pr}],
+              held_findings: held
+            }} =
+             snapshot(%{threads: [untrusted, same_pr_finding(), stale]})
+             |> ReviewConvergence.evaluate(0, 3)
+
+    assert Enum.map(held, &{&1.thread_id, &1.evidence_code}) == [
+             {"thread-untrusted", :untrusted_disposition_actor},
+             {"thread-stale", :binding_mismatch}
+           ]
+  end
+
+  test "an invalid Scope Contract holds every actionable finding without requesting another review" do
+    assert {:hold,
+            %{
+              same_pr_findings: [],
+              held_findings: [%{route: :human_hold, evidence_code: :invalid_scope_contract}]
+            }} =
              snapshot(%{
-               structural_risk: true,
-               threads: [%{resolved: false, priority: 4, body: "P4 architectural expansion"}]
+               scope_contract: {:error, [:missing_scope_contract]},
+               reviewed_head_sha: nil,
+               review_result: :missing,
+               threads: [same_pr_finding()]
              })
              |> ReviewConvergence.evaluate(0, 3)
   end
@@ -1110,7 +1269,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "actionable findings comment and return the issue for repair once per head and finding" do
-    finding = %{resolved: false, priority: 1, body: "P1 data loss", url: "https://example.test/thread"}
+    finding = same_pr_finding(%{body: "P1 data loss", url: "https://example.test/thread"})
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
 
     state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
@@ -1129,9 +1288,91 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     refute_receive {:state, _, _}
   end
 
+  test "hold-only findings publish one stable comment and consume no repair round or rereview" do
+    finding = held_finding(%{body: "P1 first wording", url: "https://example.test/held"})
+    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
+
+    state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+
+    assert_receive {:status, _, "head", :pending, _}
+    assert_receive {:comment, "issue-160", comment}
+    assert comment =~ "held review findings"
+    assert comment =~ "missing_disposition"
+    assert comment =~ "https://example.test/held"
+    refute_receive {:review_requested, _, _, _}
+    refute_receive {:state, _, _}
+    assert state["issue-160"].fix_rounds == 0
+
+    _state = ReviewMonitor.run_with(state, settings(), ReviewClient, Tracker)
+    refute_receive {:status, _, _, _, _}
+    refute_receive {:comment, _, _}
+    refute_receive {:review_requested, _, _, _}
+    refute_receive {:state, _, _}
+  end
+
+  test "held-finding restart dedup is independent of prose wording" do
+    first = held_finding(%{body: "P1 original wording"})
+    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [first]})})
+
+    first_state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+    assert_receive {:status, _, "head", :pending, _}
+    assert_receive {:comment, "issue-160", _comment}
+
+    Application.put_env(
+      :symphony_elixir,
+      :review_history,
+      {:ok, %{dedup: first_state["issue-160"].dedup, rework_count: 0}}
+    )
+
+    rewritten = held_finding(%{body: "P1 completely rewritten prose"})
+    Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [rewritten]})})
+
+    restarted = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+    assert_receive {:status, _, "head", :pending, _}
+    refute_receive {:comment, _, _}
+    refute_receive {:review_requested, _, _, _}
+    refute_receive {:state, _, _}
+    assert restarted["issue-160"].fix_rounds == 0
+  end
+
+  test "mixed findings persist held evidence separately before repairing only verified same-PR work" do
+    held = held_finding(%{url: "https://example.test/held"})
+    same_pr = same_pr_finding(%{url: "https://example.test/same-pr"})
+
+    Application.put_env(
+      :symphony_elixir,
+      :review_snapshot,
+      {:ok, snapshot(%{threads: [held, same_pr]})}
+    )
+
+    state = ReviewMonitor.run_with(%{}, settings(), ReviewClient, Tracker)
+
+    assert_receive {:status, _, "head", :failure, _}
+    assert_receive {:comment, "issue-160", held_comment}
+    assert held_comment =~ "held review findings"
+    assert held_comment =~ "https://example.test/held"
+
+    assert_receive {:comment, "issue-160", rework_comment}
+    assert rework_comment =~ "https://example.test/same-pr"
+    refute rework_comment =~ "https://example.test/held"
+
+    assert_receive {:comment, "issue-160", intent_comment}
+    assert intent_comment =~ "transition-operation: `intent`"
+    assert_receive {:state, "issue-160", "In Progress"}
+    assert_receive {:comment, "issue-160", completed_comment}
+    assert completed_comment =~ "transition-operation: `completed`"
+
+    assert state["issue-160"].fix_rounds == 1
+    assert state["issue-160"].last_finding_fingerprint == [same_pr_identity()]
+
+    _state = ReviewMonitor.run_with(state, settings(), ReviewClient, Tracker)
+    refute_receive {:comment, _, _}
+    refute_receive {:state, _, _}
+  end
+
   test "persisted rework key prevents duplicate tracker effects after restart" do
-    finding = %{resolved: false, priority: 1, body: "P1 data loss", url: "https://example.test/thread"}
-    fingerprint = [{1, nil, "P1 data loss"}]
+    finding = same_pr_finding(%{body: "P1 data loss", url: "https://example.test/thread"})
+    fingerprint = [same_pr_identity()]
     key = ReviewConvergence.dedup_key(:rework, "issue-160", "head", fingerprint)
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
 
@@ -1150,8 +1391,8 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "state transition retries after the rework comment already persisted" do
-    finding = %{resolved: false, priority: 1, body: "P1 state retry", url: "thread"}
-    fingerprint = [{1, nil, "P1 state retry"}]
+    finding = same_pr_finding(%{body: "P1 state retry", url: "thread"})
+    fingerprint = [same_pr_identity()]
     key = ReviewConvergence.dedup_key(:rework, "issue-160", "head", fingerprint)
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
     Application.put_env(:symphony_elixir, :review_state_result, {:error, :linear_unavailable})
@@ -1194,7 +1435,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "state transition completion requires authoritative target-state readback" do
-    finding = %{resolved: false, priority: 1, body: "P1 state race", url: "thread"}
+    finding = same_pr_finding(%{body: "P1 state race", url: "thread"})
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
     Application.put_env(:symphony_elixir, :verified_issue_state, "In Review")
 
@@ -1363,7 +1604,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "persistent actionable findings escalate instead of scheduling another repair" do
-    finding = %{resolved: false, priority: 3, body: "P3 recurring patch", url: "thread"}
+    finding = same_pr_finding(%{priority: 3, body: "P3 recurring patch", url: "thread"})
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
 
     entry = %{
@@ -1385,7 +1626,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
   end
 
   test "persisted rework rounds survive restart and force human escalation" do
-    finding = %{resolved: false, priority: 2, body: "P2 recurring patch", url: "thread"}
+    finding = same_pr_finding(%{priority: 2, body: "P2 recurring patch", url: "thread"})
     Application.put_env(:symphony_elixir, :review_snapshot, {:ok, snapshot(%{threads: [finding]})})
     Application.put_env(:symphony_elixir, :review_history, {:ok, %{dedup: MapSet.new(), rework_count: 3}})
 
@@ -1451,6 +1692,108 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     }
   end
 
+  defp scope_contract do
+    %ScopeContract{
+      work_item: "Route verified review findings.",
+      invariants: ["Preserve tenant boundaries."],
+      acceptance_criteria: ["AC-1: Fix verified finding."],
+      non_goals: ["Do not infer scope from prose."],
+      dependencies: ["PR #8 is merged."],
+      follow_ups: []
+    }
+  end
+
+  defp scope_contract_body do
+    """
+    #### Scope Contract
+
+    ##### Work Item
+
+    Route verified review findings.
+
+    ##### Invariants
+
+    - Preserve tenant boundaries.
+
+    ##### Acceptance Criteria
+
+    - AC-1: Fix verified finding.
+
+    ##### Non-Goals
+
+    - Do not infer scope from prose.
+
+    ##### Dependencies
+
+    - PR #8 is merged.
+
+    ##### Follow-Ups
+
+    None
+    """
+  end
+
+  defp trusted_actor do
+    %{
+      "login" => "chatgpt-codex-connector[bot]",
+      "__typename" => "Bot",
+      "databaseId" => 199_175_422
+    }
+  end
+
+  defp same_pr_payload do
+    %{
+      "schema_version" => 1,
+      "kind" => "same_pr",
+      "binding" => %{
+        "base_sha" => "base",
+        "head_sha" => "head",
+        "path" => "lib/example.ex"
+      },
+      "scope_ref" => %{"type" => "acceptance_criterion", "id" => "AC-1"}
+    }
+  end
+
+  defp same_pr_finding(overrides \\ %{}) do
+    Map.merge(
+      %{
+        resolved: false,
+        priority: 1,
+        body: "P1 verified same-PR finding",
+        path: "lib/example.ex",
+        url: "https://example.test/same-pr",
+        commit_sha: "head",
+        thread_id: "thread-same",
+        finding_comment_id: "comment-same",
+        disposition_actor: trusted_actor(),
+        disposition: {:decoded, same_pr_payload()}
+      },
+      overrides
+    )
+  end
+
+  defp held_finding(overrides \\ %{}) do
+    Map.merge(
+      %{
+        resolved: false,
+        priority: 1,
+        body: "P1 finding without disposition metadata",
+        path: "lib/held.ex",
+        url: "https://example.test/held",
+        commit_sha: "head",
+        thread_id: "thread-held",
+        finding_comment_id: "comment-held",
+        disposition_actor: trusted_actor(),
+        disposition: :missing
+      },
+      overrides
+    )
+  end
+
+  defp same_pr_identity do
+    {"thread-same", "comment-same", :same_pr, :scope_contract_reference_verified}
+  end
+
   defp snapshot(overrides \\ %{}) do
     Map.merge(
       %{
@@ -1462,6 +1805,7 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
         base_ref_oid: "base",
         base_verification_required: false,
         base_verification: :not_required,
+        scope_contract: {:ok, scope_contract()},
         required_checks: [%{name: "test", state: :success}],
         threads: [],
         waiting_reason: nil

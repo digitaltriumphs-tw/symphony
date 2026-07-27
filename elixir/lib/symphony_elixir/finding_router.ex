@@ -59,6 +59,7 @@ defmodule SymphonyElixir.FindingRouter do
           | :unknown_disposition_field
           | :binding_mismatch
           | :missing_finding_identity
+          | :invalid_scope_contract
           | :invalid_scope_reference
           | :scope_reference_mismatch
           | :invalid_current_pr_diff_proof

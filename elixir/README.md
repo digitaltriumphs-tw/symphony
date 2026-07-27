@@ -44,9 +44,13 @@ state. The monitor resolves the PR from the issue branch, invalidates old-head r
 `@codex review` per head, and requires a current-head clean review result, passing required checks,
 and no unresolved P1-P4 review thread. Formal reviews are preferred; the restricted issue-comment
 compatibility path also verifies the unique request, time ordering, immutable App/bot identities,
-and reviewed commit. Actionable findings return the issue to the
-configured in-progress state; unverifiable evidence and repeated non-convergence remain in review
-for a deduplicated human decision. The monitor never merges or moves an issue to Done.
+and reviewed commit. Each actionable finding must carry one exact
+`symphony-finding-disposition:v1` block on that same trusted GitHub comment, bound to the exact
+base SHA, head SHA, path, and typed PR Scope Contract. Only verified same-PR findings return the
+issue to the configured in-progress state. Missing, untrusted, malformed, stale, prerequisite,
+follow-up, and explicit hold findings remain In Review in one stable deduplicated hold record;
+mixed held evidence is recorded before verified same-PR repair. The monitor never merges or moves
+an issue to Done.
 Rework uses Linear comment history as a scoped durable transition log: an operation intent is
 persisted before the state change, each step is retry-safe, and an incomplete operation is resumed
 even after the issue has entered In Progress or the runtime has restarted. A fix round is counted
@@ -226,8 +230,10 @@ mix pr_body.check --file /path/to/pr_body.md
 ```
 
 The lint statically validates the contract; it does not classify review findings or move tracker
-issues. Severity and ownership are separate. Later routing may consume the typed contract only
-under its own policy; unknown ownership must remain in review for follow-up or human disposition.
+issues. Severity and ownership are separate. Review routing consumes the typed result under its
+own fail-closed policy; unknown ownership remains in review for follow-up or human disposition.
+Disposition dedup uses sorted `{thread_id, finding_comment_id, route, evidence_code}` identities,
+not finding prose. Hold-only findings do not consume a retry round or trigger another review.
 When this lint applies to an existing PR, update its description to the structured contract.
 
 Run the real external end-to-end test only when you want Symphony to create disposable Linear

@@ -6,10 +6,13 @@ defmodule SymphonyElixir.ReviewConvergence do
   terminal tracker transition.
   """
 
+  alias SymphonyElixir.{FindingRouter, ScopeContract}
+
   @type decision ::
           {:converged, map()}
           | {:request_review, map()}
           | {:rework, map()}
+          | {:hold, map()}
           | {:wait, map()}
           | {:escalate, map()}
 
@@ -17,12 +20,13 @@ defmodule SymphonyElixir.ReviewConvergence do
   def evaluate(snapshot, fix_rounds, max_fix_rounds)
       when is_map(snapshot) and is_integer(fix_rounds) and is_integer(max_fix_rounds) do
     actionable = Enum.filter(snapshot[:threads] || [], &actionable_thread?/1)
-    gate_evidence = evidence(snapshot, actionable)
+    {same_pr_findings, held_findings} = route_actionable(snapshot, actionable)
+    gate_evidence = evidence(snapshot, actionable, same_pr_findings, held_findings)
 
     with :continue <- waiting_gate(snapshot, gate_evidence),
          :continue <- current_head_gate(snapshot, gate_evidence),
          :continue <- base_gate(snapshot, gate_evidence),
-         :continue <- actionable_gate(snapshot, actionable, gate_evidence, fix_rounds, max_fix_rounds),
+         :continue <- actionable_gate(actionable, gate_evidence, fix_rounds, max_fix_rounds),
          :continue <- review_gate(snapshot, gate_evidence),
          :continue <- checks_gate(snapshot, gate_evidence) do
       {:converged, gate_evidence}
@@ -63,13 +67,18 @@ defmodule SymphonyElixir.ReviewConvergence do
     end
   end
 
-  defp actionable_gate(_snapshot, [], _evidence, _fix_rounds, _max_fix_rounds), do: :continue
+  defp actionable_gate([], _evidence, _fix_rounds, _max_fix_rounds), do: :continue
 
-  defp actionable_gate(snapshot, _actionable, evidence, fix_rounds, max_fix_rounds) do
-    if escalation_required?(snapshot, fix_rounds, max_fix_rounds) do
-      {:escalate, Map.put(evidence, :reason, :review_not_converging)}
-    else
-      {:rework, evidence}
+  defp actionable_gate(_actionable, evidence, fix_rounds, max_fix_rounds) do
+    cond do
+      evidence.same_pr_findings == [] ->
+        {:hold, Map.put(evidence, :reason, :no_verified_same_pr_findings)}
+
+      fix_rounds >= max_fix_rounds ->
+        {:escalate, Map.put(evidence, :reason, :review_not_converging)}
+
+      true ->
+        {:rework, evidence}
     end
   end
 
@@ -98,11 +107,42 @@ defmodule SymphonyElixir.ReviewConvergence do
     snapshot[:base_verification_required] == true and snapshot[:base_verification] != :verified
   end
 
-  defp escalation_required?(snapshot, fix_rounds, max_fix_rounds) do
-    fix_rounds >= max_fix_rounds or snapshot[:structural_risk] == true
+  defp route_actionable(_snapshot, []), do: {[], []}
+
+  defp route_actionable(snapshot, actionable) do
+    routed =
+      case snapshot[:scope_contract] do
+        {:ok, %ScopeContract{} = contract} ->
+          binding = %{
+            base_sha: snapshot[:base_ref_oid],
+            head_sha: snapshot[:current_head_sha]
+          }
+
+          Enum.map(actionable, &FindingRouter.route(contract, &1, binding))
+
+        _invalid_scope_contract ->
+          Enum.map(actionable, &invalid_scope_contract_record/1)
+      end
+
+    Enum.split_with(routed, &(&1.route == :same_pr))
   end
 
-  defp evidence(snapshot, actionable) do
+  defp invalid_scope_contract_record(finding) do
+    %{
+      thread_id: finding[:thread_id],
+      finding_comment_id: finding[:finding_comment_id],
+      route: :human_hold,
+      evidence_code: :invalid_scope_contract,
+      evidence_display: "PR Scope Contract is invalid or missing",
+      original_kind: nil,
+      priority: finding[:priority],
+      path: finding[:path],
+      url: finding[:url],
+      evidence: %{}
+    }
+  end
+
+  defp evidence(snapshot, actionable, same_pr_findings, held_findings) do
     %{
       current_head_sha: snapshot[:current_head_sha],
       reviewed_head_sha: snapshot[:reviewed_head_sha],
@@ -110,7 +150,9 @@ defmodule SymphonyElixir.ReviewConvergence do
       base_ref_oid: snapshot[:base_ref_oid],
       base_verification: snapshot[:base_verification],
       required_checks: snapshot[:required_checks] || [],
-      actionable_threads: actionable
+      actionable_threads: actionable,
+      same_pr_findings: same_pr_findings,
+      held_findings: held_findings
     }
   end
 end

@@ -189,7 +189,8 @@ defmodule SymphonyElixir.ReviewMonitor do
   end
 
   defp apply_decision({:rework, evidence}, issue, entry, settings, review_client, tracker, snapshot) do
-    findings = evidence.actionable_threads
+    findings = evidence.same_pr_findings
+    held_findings = evidence.held_findings
     fingerprint = finding_fingerprint(findings)
     key = ReviewConvergence.dedup_key(:rework, issue.id, snapshot.current_head_sha, fingerprint)
 
@@ -199,10 +200,36 @@ defmodule SymphonyElixir.ReviewMonitor do
            settings.repository,
            snapshot,
            :failure,
-           "Unresolved actionable P1-P4 review findings"
+           "Unresolved verified same-PR review findings"
          ) do
       {entry, :ok} ->
-        apply_rework(issue, entry, settings, tracker, snapshot, findings, fingerprint, key)
+        case persist_held_findings(issue, entry, tracker, snapshot, held_findings) do
+          {entry, held_result} when held_result in [:ok, :deduplicated] ->
+            apply_rework(issue, entry, settings, tracker, snapshot, findings, fingerprint, key)
+
+          {entry, {:error, reason}} ->
+            {entry, {:error, reason}}
+        end
+
+      {entry, {:error, reason}} ->
+        {entry, {:error, reason}}
+    end
+  end
+
+  defp apply_decision({:hold, evidence}, issue, entry, settings, review_client, tracker, snapshot) do
+    case ensure_published_status(
+           entry,
+           review_client,
+           settings.repository,
+           snapshot,
+           :pending,
+           "Review findings held for verified disposition"
+         ) do
+      {entry, :ok} ->
+        persist_held_findings(issue, entry, tracker, snapshot, evidence.held_findings)
+        |> then(fn {updated, result} ->
+          {%{updated | waiting: result in [:ok, :deduplicated]}, result}
+        end)
 
       {entry, {:error, reason}} ->
         {entry, {:error, reason}}
@@ -234,22 +261,21 @@ defmodule SymphonyElixir.ReviewMonitor do
   defp apply_decision({:escalate, evidence}, issue, entry, settings, review_client, tracker, snapshot) do
     key = ReviewConvergence.dedup_key(:escalate, issue.id, snapshot.current_head_sha, evidence[:reason])
 
-    with {entry, :ok} <-
-           ensure_published_status(
-             entry,
-             review_client,
-             settings.repository,
-             snapshot,
-             :failure,
-             "Review did not converge; human decision required"
-           ) do
-      dedup_action(entry, key, fn ->
-        tracker.create_comment(issue.id, human_comment(settings, snapshot, :review_not_converging, key))
-      end)
+    case ensure_published_status(
+           entry,
+           review_client,
+           settings.repository,
+           snapshot,
+           :failure,
+           "Review did not converge; human decision required"
+         ) do
+      {entry, :ok} ->
+        apply_escalation(issue, entry, settings, tracker, snapshot, evidence.held_findings, key)
+
+      {entry, {:error, reason}} ->
+        {entry, {:error, reason}}
     end
-    |> then(fn {updated, result} ->
-      {%{updated | waiting: result == :ok}, result}
-    end)
+    |> then(fn {updated, result} -> {%{updated | waiting: result in [:ok, :deduplicated]}, result} end)
   end
 
   defp apply_decision({:converged, _evidence}, issue, entry, settings, review_client, tracker, snapshot) do
@@ -276,6 +302,15 @@ defmodule SymphonyElixir.ReviewMonitor do
 
       {:error, reason} ->
         {entry, {:error, reason}}
+    end
+  end
+
+  defp apply_escalation(issue, entry, settings, tracker, snapshot, held_findings, key) do
+    with {entry, held_result} when held_result in [:ok, :deduplicated] <-
+           persist_held_findings(issue, entry, tracker, snapshot, held_findings) do
+      dedup_action(entry, key, fn ->
+        tracker.create_comment(issue.id, human_comment(settings, snapshot, :review_not_converging, key))
+      end)
     end
   end
 
@@ -441,7 +476,29 @@ defmodule SymphonyElixir.ReviewMonitor do
   end
 
   defp finding_fingerprint(findings) do
-    Enum.map(findings, &{&1[:priority], &1[:path], &1[:body]})
+    findings
+    |> Enum.map(&finding_identity/1)
+    |> Enum.sort()
+  end
+
+  defp finding_identity(finding) do
+    {
+      finding[:thread_id],
+      finding[:finding_comment_id],
+      finding[:route],
+      finding[:evidence_code]
+    }
+  end
+
+  defp persist_held_findings(_issue, entry, _tracker, _snapshot, []), do: {entry, :ok}
+
+  defp persist_held_findings(issue, entry, tracker, snapshot, held_findings) do
+    fingerprint = finding_fingerprint(held_findings)
+    key = ReviewConvergence.dedup_key(:hold, issue.id, snapshot.current_head_sha, fingerprint)
+
+    dedup_action(entry, key, fn ->
+      tracker.create_comment(issue.id, held_findings_comment(snapshot, held_findings, key))
+    end)
   end
 
   defp publish_status(_review_client, _repository, %{current_head_sha: head}, _state, _description)
@@ -468,10 +525,13 @@ defmodule SymphonyElixir.ReviewMonitor do
   end
 
   defp rework_comment(snapshot, findings, key) do
-    details = Enum.map_join(findings, "\n", fn finding -> "- P#{finding.priority}: #{finding.url || finding.path || finding.body}" end)
+    details =
+      Enum.map_join(findings, "\n", fn finding ->
+        "- P#{finding.priority}: #{finding.url || finding.path || finding_identity_display(finding)}"
+      end)
 
     """
-    Review Convergence Gate found actionable latest-head findings.
+    Review Convergence Gate found actionable latest-head findings verified for this PR.
 
     - PR: ##{snapshot.pull_request_number}
     - currentHeadSha: `#{snapshot.current_head_sha}`
@@ -480,6 +540,29 @@ defmodule SymphonyElixir.ReviewMonitor do
     Symphony should reuse the same branch/PR and fix only these scoped findings.
     dedup-key: `#{key}`
     """
+  end
+
+  defp held_findings_comment(snapshot, findings, key) do
+    details =
+      Enum.map_join(findings, "\n", fn finding ->
+        location = finding.url || finding.path || finding_identity_display(finding)
+        "- P#{finding.priority}: `#{finding.route}` / `#{finding.evidence_code}` / #{location}"
+      end)
+
+    """
+    Review Convergence Gate held review findings that lack verified same-PR ownership.
+
+    - PR: ##{snapshot.pull_request_number}
+    - currentHeadSha: `#{snapshot.current_head_sha}`
+    #{details}
+
+    The issue remains In Review. These findings require corrected trusted metadata or team human disposition; no repair round or rereview was consumed.
+    dedup-key: `#{key}`
+    """
+  end
+
+  defp finding_identity_display(finding) do
+    "thread #{finding.thread_id || "unknown"}, comment #{finding.finding_comment_id || "unknown"}"
   end
 
   defp state_transition_comment(snapshot, key) do

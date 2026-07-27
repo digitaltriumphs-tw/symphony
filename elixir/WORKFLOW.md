@@ -427,10 +427,12 @@ static boundary only: it does not classify findings or move issues in this chang
 scope ownership are separate, so do not treat finding severity as proof that the current PR owns
 the work.
 
-Later review-routing policy may consume the typed contract. It may return a finding to the same PR
-only after proving that the finding violates a declared invariant or acceptance criterion, or that
-the PR introduced the defect. If ownership is unknown, fail closed: keep the issue In Review for a
-follow-up or human disposition.
+Review routing consumes the typed contract separately from static lint. Every actionable finding
+must put exactly one `symphony-finding-disposition:v1` metadata block on that same GitHub finding
+comment. The trusted immutable actor, exact base SHA, head SHA, path, allowed fields, and exact
+Scope Contract reference or kind-specific proof must verify. Severity never supplies ownership.
+Missing, malformed, duplicate, untrusted, stale, or unknown evidence fails closed and keeps the
+issue In Review.
 
 Review Convergence Runtime
 
@@ -447,10 +449,15 @@ deduplicated `@codex review` request.
 The runtime publishes `Review Convergence Gate` as a commit status for ruleset enforcement. That
 status is an output of the gate and is excluded from its prerequisite required-check set.
 
-Actionable P1-P4 findings move the issue back to In Progress once per head/finding fingerprint and
-reuse the same branch and PR. Waiting for staging, permissions, or human product/safety decisions
-keeps the issue In Review and pauses retries without repeating a full review. Technical convergence
-never authorizes merge, deployment, production changes, permission changes, or Done.
+Only verified same-PR P1-P4 findings move the issue back to In Progress and reuse the same branch
+and PR. Hold-only findings stay In Review without another review, state change, or fix round. For a
+mixed result, the held findings are persisted separately before the same-PR transition. Both hold
+and rework dedup use sorted `{thread_id, finding_comment_id, route, evidence_code}` identities, not
+mutable prose. The retry limit applies only to same-PR transitions. Waiting for staging,
+permissions, or human product/safety decisions keeps the issue In Review and pauses retries.
+Technical convergence never authorizes merge, deployment, production changes, permission changes,
+or Done. This v1 does not add readiness evaluation, finding clustering/budgets, ruleset or merge
+authorization, or metrics.
 
 The state move is a recoverable transition, not two best-effort writes. Review Monitor first
 persists a stable operation intent in Linear, then moves the issue, then persists a completion
