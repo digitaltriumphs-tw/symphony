@@ -15,7 +15,6 @@ defmodule SymphonyElixir.ReviewConvergence do
           | {:hold, map()}
           | {:convergence_hold, map()}
           | {:wait, map()}
-          | {:escalate, map()}
 
   @spec evaluate(map(), non_neg_integer(), pos_integer()) :: decision()
   def evaluate(snapshot, fix_rounds, max_fix_rounds)

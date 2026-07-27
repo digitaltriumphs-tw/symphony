@@ -304,26 +304,6 @@ defmodule SymphonyElixir.ReviewMonitor do
     end)
   end
 
-  defp apply_decision({:escalate, evidence}, issue, entry, settings, review_client, tracker, snapshot) do
-    key = ReviewConvergence.dedup_key(:escalate, issue.id, snapshot.current_head_sha, evidence[:reason])
-
-    case ensure_published_status(
-           entry,
-           review_client,
-           settings.repository,
-           snapshot,
-           :failure,
-           "Review did not converge; human decision required"
-         ) do
-      {entry, :ok} ->
-        apply_escalation(issue, entry, settings, tracker, snapshot, evidence.held_findings, key)
-
-      {entry, {:error, reason}} ->
-        {entry, {:error, reason}}
-    end
-    |> then(fn {updated, result} -> {%{updated | waiting: result in [:ok, :deduplicated]}, result} end)
-  end
-
   defp apply_decision({:converged, _evidence}, issue, entry, settings, review_client, tracker, snapshot) do
     key = ReviewConvergence.dedup_key(:converged, issue.id, snapshot.current_head_sha, :technical)
 
@@ -348,15 +328,6 @@ defmodule SymphonyElixir.ReviewMonitor do
 
       {:error, reason} ->
         {entry, {:error, reason}}
-    end
-  end
-
-  defp apply_escalation(issue, entry, settings, tracker, snapshot, held_findings, key) do
-    with {entry, held_result} when held_result in [:ok, :deduplicated] <-
-           persist_held_findings(issue, entry, tracker, snapshot, held_findings) do
-      dedup_action(entry, key, fn ->
-        tracker.create_comment(issue.id, human_comment(settings, snapshot, :review_not_converging, key))
-      end)
     end
   end
 
