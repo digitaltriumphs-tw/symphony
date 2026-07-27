@@ -66,6 +66,11 @@ defmodule SymphonyElixir.ScopeContract do
           follow_ups: [String.t()]
         }
 
+  @type scope_reference ::
+          {:acceptance_criterion, String.t()}
+          | {:invariant, String.t()}
+          | {:dependency, String.t()}
+
   @typep normalized_item :: {:value, String.t()} | {:none, :standalone | :continued}
   @typep token_kind ::
            :blank
@@ -104,6 +109,22 @@ defmodule SymphonyElixir.ScopeContract do
         end
     end
   end
+
+  @spec reference_exists?(t(), scope_reference()) :: boolean()
+  def reference_exists?(%__MODULE__{} = contract, {:acceptance_criterion, identifier})
+      when is_binary(identifier) do
+    Enum.any?(contract.acceptance_criteria, fn criterion ->
+      acceptance_criterion_identifier(criterion) == {:ok, identifier}
+    end)
+  end
+
+  def reference_exists?(%__MODULE__{} = contract, {:invariant, value}) when is_binary(value),
+    do: value in contract.invariants
+
+  def reference_exists?(%__MODULE__{} = contract, {:dependency, value}) when is_binary(value),
+    do: value in contract.dependencies
+
+  def reference_exists?(%__MODULE__{}, _reference), do: false
 
   defp scope_contract_tokens(pr_body) do
     tokens = tokenize(pr_body)

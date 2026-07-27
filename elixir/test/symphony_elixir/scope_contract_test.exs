@@ -1395,4 +1395,30 @@ defmodule SymphonyElixir.ScopeContractTest do
     assert {:error, [{:malformed_bullet, :invariants, "IO.puts(\"nested tab code\")"}]} =
              ScopeContract.parse_pr_body(code_body)
   end
+
+  test "resolves only exact typed references from a parsed contract" do
+    # Mutations caught: matching nearby prose, accepting an unknown AC ID, or treating an absent dependency as present.
+    body =
+      @complete_contract
+      |> String.replace("None\n\n##### Follow-Ups", "- PR #8 is merged.\n\n##### Follow-Ups")
+
+    assert {:ok, contract} = ScopeContract.parse_pr_body(body)
+
+    assert ScopeContract.reference_exists?(contract, {:acceptance_criterion, "AC-1"})
+    refute ScopeContract.reference_exists?(contract, {:acceptance_criterion, "AC-3"})
+    refute ScopeContract.reference_exists?(contract, {:acceptance_criterion, "AC-1:"})
+
+    assert ScopeContract.reference_exists?(
+             contract,
+             {:invariant, "The parser reads only explicit Scope Contract headings."}
+           )
+
+    refute ScopeContract.reference_exists?(
+             contract,
+             {:invariant, "parser reads only explicit Scope Contract headings"}
+           )
+
+    assert ScopeContract.reference_exists?(contract, {:dependency, "PR #8 is merged."})
+    refute ScopeContract.reference_exists?(contract, {:dependency, "PR #8"})
+  end
 end
