@@ -73,6 +73,90 @@ defmodule SymphonyElixir.FindingRouterTest do
     assert :missing = FindingRouter.extract_disposition(fenced)
   end
 
+  test "closes fenced examples only with CommonMark marker and ASCII whitespace rules" do
+    # Mutations caught: trimming Unicode whitespace, accepting short markers, or allowing four-space indentation.
+    disposition = """
+    <!-- symphony-finding-disposition:v1
+    {"schema_version":1,"kind":"human_hold","binding":{"base_sha":"base-123","head_sha":"head-456","path":"lib/router.ex"}}
+    -->
+    """
+
+    valid_closers = [
+      {"```json", "```"},
+      {"```json", " ````"},
+      {"```json", "  ```\t"},
+      {"```json", "   ``` \t"},
+      {"~~~~text", "~~~~~"}
+    ]
+
+    for {opening, closing} <- valid_closers do
+      assert {:decoded, %{"kind" => "human_hold"}} =
+               FindingRouter.extract_disposition("#{opening}\n#{closing}\n#{disposition}")
+    end
+
+    invalid_closers = [
+      {"````json", "```"},
+      {"```json", "    ```"},
+      {"```json", "```\u00A0"},
+      {"~~~text", "~~~\u2003"},
+      {"~~~text", "```"}
+    ]
+
+    for {opening, false_closing} <- invalid_closers do
+      body = "#{opening}\n#{false_closing}\n#{disposition}\n#{String.slice(opening, 0, 3)}"
+      assert :missing = FindingRouter.extract_disposition(body)
+    end
+  end
+
+  test "rejects duplicate JSON members at the top level and in nested objects" do
+    # Mutations caught: decoding to maps before checking ambiguity or checking only root object keys.
+    top_level_duplicate = """
+    <!-- symphony-finding-disposition:v1
+    {"schema_version":1,"kind":"same_pr","kind":"human_hold","binding":{"base_sha":"base-123","head_sha":"head-456","path":"lib/router.ex"},"scope_ref":{"type":"acceptance_criterion","id":"AC-2"}}
+    -->
+    """
+
+    nested_duplicate = """
+    <!-- symphony-finding-disposition:v1
+    {"schema_version":1,"kind":"same_pr","binding":{"base_sha":"base-123","head_sha":"head-456","path":"lib/router.ex","path":"lib/other.ex"},"scope_ref":{"type":"acceptance_criterion","id":"AC-2"}}
+    -->
+    """
+
+    assert {:error, :malformed} = FindingRouter.extract_disposition(top_level_duplicate)
+    assert {:error, :malformed} = FindingRouter.extract_disposition(nested_duplicate)
+  end
+
+  test "routes extracted duplicate JSON members to human hold" do
+    # Mutations caught: allowing duplicate members to retain a same-PR ownership claim after normalization.
+    duplicate_blocks = [
+      """
+      <!-- symphony-finding-disposition:v1
+      {"schema_version":1,"kind":"same_pr","kind":"human_hold","binding":{"base_sha":"base-123","head_sha":"head-456","path":"lib/router.ex"},"scope_ref":{"type":"acceptance_criterion","id":"AC-2"}}
+      -->
+      """,
+      """
+      <!-- symphony-finding-disposition:v1
+      {"schema_version":1,"kind":"same_pr","binding":{"base_sha":"base-123","head_sha":"head-456","path":"lib/router.ex","path":"lib/other.ex"},"scope_ref":{"type":"acceptance_criterion","id":"AC-2"}}
+      -->
+      """
+    ]
+
+    for {body, index} <- Enum.with_index(duplicate_blocks, 1) do
+      finding = %{
+        thread_id: "thread-duplicate-member-#{index}",
+        finding_comment_id: "comment-duplicate-member-#{index}",
+        disposition_actor: @trusted_actor,
+        disposition: FindingRouter.extract_disposition(body),
+        priority: 1,
+        path: "lib/router.ex",
+        url: "https://example.test/duplicate-member-#{index}"
+      }
+
+      assert %{route: :human_hold, evidence_code: :malformed_disposition} =
+               FindingRouter.route(@contract, finding, @binding)
+    end
+  end
+
   test "fails closed on malformed, duplicate, and oversized disposition blocks" do
     # Mutations caught: selecting one duplicate, recovering invalid JSON, or parsing an unbounded comment payload.
     malformed = """

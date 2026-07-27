@@ -160,11 +160,16 @@ defmodule SymphonyElixir.FindingRouter do
   defp closing_fence?(line, {marker, opening_count}) do
     with {:ok, content} <- document_content(line),
          {count, rest} <- leading_marker(content, marker) do
-      count >= opening_count and String.trim(rest) == ""
+      count >= opening_count and ascii_space_or_tab?(rest)
     else
       _ -> false
     end
   end
+
+  defp ascii_space_or_tab?(""), do: true
+  defp ascii_space_or_tab?(<<" ", rest::binary>>), do: ascii_space_or_tab?(rest)
+  defp ascii_space_or_tab?(<<"\t", rest::binary>>), do: ascii_space_or_tab?(rest)
+  defp ascii_space_or_tab?(_rest), do: false
 
   defp document_content(line) do
     content = String.trim_leading(line, " ")
@@ -183,9 +188,57 @@ defmodule SymphonyElixir.FindingRouter do
   defp decode_block(block) when byte_size(block) > @max_disposition_bytes, do: {:error, :too_large}
 
   defp decode_block(block) do
-    case Jason.decode(block) do
-      {:ok, decoded} when is_map(decoded) -> {:decoded, decoded}
+    case Jason.decode(block, objects: :ordered_objects) do
+      {:ok, %Jason.OrderedObject{} = decoded} -> decode_unique_object(decoded)
       _other -> {:error, :malformed}
+    end
+  end
+
+  defp decode_unique_object(decoded) do
+    case unique_json_value(decoded) do
+      {:ok, map} -> {:decoded, map}
+      :duplicate -> {:error, :malformed}
+    end
+  end
+
+  defp unique_json_value(%Jason.OrderedObject{values: members}) do
+    Enum.reduce_while(members, {:ok, {MapSet.new(), %{}}}, &unique_object_member/2)
+    |> case do
+      {:ok, {_keys, map}} -> {:ok, map}
+      :duplicate -> :duplicate
+    end
+  end
+
+  defp unique_json_value(values) when is_list(values) do
+    Enum.reduce_while(values, {:ok, []}, fn value, {:ok, normalized_values} ->
+      case unique_json_value(value) do
+        {:ok, normalized} -> {:cont, {:ok, [normalized | normalized_values]}}
+        :duplicate -> {:halt, :duplicate}
+      end
+    end)
+    |> case do
+      {:ok, normalized_values} -> {:ok, Enum.reverse(normalized_values)}
+      :duplicate -> :duplicate
+    end
+  end
+
+  defp unique_json_value(value), do: {:ok, value}
+
+  defp unique_object_member({key, value}, {:ok, {keys, map}}) do
+    if MapSet.member?(keys, key) do
+      {:halt, :duplicate}
+    else
+      unique_object_value(key, value, keys, map)
+    end
+  end
+
+  defp unique_object_value(key, value, keys, map) do
+    case unique_json_value(value) do
+      {:ok, normalized} ->
+        {:cont, {:ok, {MapSet.put(keys, key), Map.put(map, key, normalized)}}}
+
+      :duplicate ->
+        {:halt, :duplicate}
     end
   end
 
