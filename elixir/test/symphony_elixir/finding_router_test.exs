@@ -157,6 +157,29 @@ defmodule SymphonyElixir.FindingRouterTest do
     end
   end
 
+  test "normalizes arrays recursively and rejects a duplicate object member inside an array" do
+    # Mutations caught: skipping recursive array normalization or accepting ambiguity below an array boundary.
+    valid_array = """
+    <!-- symphony-finding-disposition:v1
+    {"schema_version":1,"examples":[1,{"accepted":true},"three"]}
+    -->
+    """
+
+    duplicate_inside_array = """
+    <!-- symphony-finding-disposition:v1
+    {"schema_version":1,"examples":[{"kind":"same_pr","kind":"human_hold"}]}
+    -->
+    """
+
+    assert {:decoded,
+            %{
+              "schema_version" => 1,
+              "examples" => [1, %{"accepted" => true}, "three"]
+            }} = FindingRouter.extract_disposition(valid_array)
+
+    assert {:error, :malformed} = FindingRouter.extract_disposition(duplicate_inside_array)
+  end
+
   test "fails closed on malformed, duplicate, and oversized disposition blocks" do
     # Mutations caught: selecting one duplicate, recovering invalid JSON, or parsing an unbounded comment payload.
     malformed = """
@@ -561,5 +584,74 @@ defmodule SymphonyElixir.FindingRouterTest do
 
     assert %{route: :human_hold, evidence_code: :unknown_disposition_field} =
              FindingRouter.route(@contract, finding, @binding)
+  end
+
+  test "malformed normalized inputs and dependency claims retain stable human-hold evidence" do
+    # Mutations caught: trusting malformed adapter shapes or accepting unverified prerequisite ownership claims.
+    wire_binding = %{
+      "base_sha" => "base-123",
+      "head_sha" => "head-456",
+      "path" => "lib/router.ex"
+    }
+
+    typed_payload = fn kind, field, value ->
+      {:decoded,
+       %{
+         "schema_version" => 1,
+         "kind" => kind,
+         "binding" => wire_binding,
+         field => value
+       }}
+    end
+
+    human_hold =
+      {:decoded,
+       %{
+         "schema_version" => 1,
+         "kind" => "human_hold",
+         "binding" => wire_binding
+       }}
+
+    prerequisite = fn reference -> typed_payload.("prerequisite", "scope_ref", reference) end
+
+    cases = [
+      {"oversized normalization result", @trusted_actor, {:error, :too_large}, :oversized_disposition, "Disposition metadata exceeds the size limit"},
+      {"unexpected normalization shape", @trusted_actor, {:decoded, []}, :malformed_disposition, nil},
+      {"non-map actor", "chatgpt-codex-connector[bot]", human_hold, :untrusted_disposition_actor, nil},
+      {"non-map binding", @trusted_actor,
+       {:decoded,
+        %{
+          "schema_version" => 1,
+          "kind" => "human_hold",
+          "binding" => "base-123:head-456:lib/router.ex"
+        }}, :malformed_disposition, nil},
+      {"non-map same-PR reference", @trusted_actor, typed_payload.("same_pr", "scope_ref", "AC-2"), :invalid_scope_reference, nil},
+      {"non-map current-diff proof", @trusted_actor, typed_payload.("introduced_by_pr", "proof", nil), :invalid_current_pr_diff_proof, nil},
+      {"dependency reference with unknown key", @trusted_actor, prerequisite.(%{"type" => "dependency", "value" => "PR #8 is merged.", "source" => "comment"}), :unknown_disposition_field, nil},
+      {"invalid dependency reference value", @trusted_actor, prerequisite.(%{"type" => "dependency", "value" => ""}), :invalid_scope_reference, nil},
+      {"non-map dependency reference", @trusted_actor, prerequisite.(["PR #8 is merged."]), :invalid_scope_reference, nil},
+      {"dependency absent from the Scope Contract", @trusted_actor, prerequisite.(%{"type" => "dependency", "value" => "PR #99 is merged."}), :scope_reference_mismatch, nil}
+    ]
+
+    for {{label, actor, disposition, expected_code, expected_display}, index} <- Enum.with_index(cases, 1) do
+      finding = %{
+        thread_id: "thread-malformed-input-#{index}",
+        finding_comment_id: "comment-malformed-input-#{index}",
+        disposition_actor: actor,
+        disposition: disposition,
+        priority: 2,
+        path: "lib/router.ex",
+        url: "https://example.test/malformed-input-#{index}"
+      }
+
+      assert %{route: :human_hold, evidence_code: ^expected_code} =
+               routed =
+               FindingRouter.route(@contract, finding, @binding),
+             label
+
+      if expected_display do
+        assert routed.evidence_display == expected_display, label
+      end
+    end
   end
 end

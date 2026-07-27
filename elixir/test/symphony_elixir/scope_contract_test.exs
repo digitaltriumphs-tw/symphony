@@ -1420,5 +1420,7 @@ defmodule SymphonyElixir.ScopeContractTest do
 
     assert ScopeContract.reference_exists?(contract, {:dependency, "PR #8 is merged."})
     refute ScopeContract.reference_exists?(contract, {:dependency, "PR #8"})
+    refute ScopeContract.reference_exists?(contract, {:acceptance_criterion, 1})
+    refute ScopeContract.reference_exists?(contract, {:non_goal, "Do not change review routing."})
   end
 end
