@@ -134,9 +134,6 @@ defmodule SymphonyElixir.ReviewConvergence do
           true ->
             {:rework, clustered_evidence}
         end
-
-      {:error, reason} ->
-        convergence_hold(evidence, :unclusterable_evidence, [], %{cluster_error: reason})
     end
   end
 

@@ -1304,6 +1304,24 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
              |> ReviewConvergence.evaluate(history, 3)
   end
 
+  test "completed cluster history normalizes list values and ignores unusable values" do
+    cases = [
+      {[@cluster_ac_1], :convergence_hold},
+      {:invalid_history_value, :rework}
+    ]
+
+    Enum.each(cases, fn {stored_cluster_ids, expected_decision} ->
+      history =
+        empty_convergence_history(%{
+          completed_cluster_ids_by_head: %{@head_sha => stored_cluster_ids}
+        })
+
+      assert {^expected_decision, _evidence} =
+               snapshot(%{threads: [same_pr_finding()]})
+               |> ReviewConvergence.evaluate(history, 3)
+    end)
+  end
+
   test "exhausted typed budget, malformed ledger, legacy rounds, and persisted holds all fail closed" do
     finding = same_pr_finding()
 

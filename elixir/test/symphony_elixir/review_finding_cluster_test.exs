@@ -75,6 +75,7 @@ defmodule SymphonyElixir.ReviewFindingClusterTest do
       {%{scope_finding({:acceptance_criterion, "AC-1"}) | route: :human_hold}, :not_verified_same_pr},
       {%{scope_finding({:acceptance_criterion, "AC-1"}) | evidence_code: :missing_disposition}, :unsupported_evidence_code},
       {%{scope_finding({:acceptance_criterion, "AC-1"}) | evidence: %{}}, :missing_scope_reference},
+      {scope_finding({:unsupported_reference, "AC-1"}), :invalid_scope_reference},
       {%{current_diff_finding("lib/current.ex") | evidence: %{proof: :current_pr_diff}}, :missing_current_pr_diff_path}
     ]
 
@@ -83,6 +84,12 @@ defmodule SymphonyElixir.ReviewFindingClusterTest do
 
       assert {:error, {:unclusterable_finding, ^index, ^expected_reason}} =
                ReviewFindingCluster.cluster(preceding ++ [finding])
+    end)
+  end
+
+  test "non-list finding collections fail closed" do
+    Enum.each([nil, %{}, :invalid], fn findings ->
+      assert ReviewFindingCluster.cluster(findings) == {:error, :invalid_findings}
     end)
   end
 

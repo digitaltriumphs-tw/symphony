@@ -102,12 +102,8 @@ defmodule SymphonyElixir.ReviewConvergenceLedger do
 
   @spec encode(event()) :: {:ok, String.t()} | {:error, parse_error()}
   def encode(event) when is_map(event) do
-    with {:ok, wire} <- event_to_wire(event),
-         {:ok, json} <- Jason.encode(wire) do
-      {:ok, @sentinel_open <> json <> @sentinel_close}
-    else
-      {:error, %Jason.EncodeError{}} -> {:error, :invalid_ledger_event}
-      {:error, reason} -> {:error, reason}
+    with {:ok, wire} <- event_to_wire(event) do
+      {:ok, @sentinel_open <> Jason.encode!(wire) <> @sentinel_close}
     end
   end
 

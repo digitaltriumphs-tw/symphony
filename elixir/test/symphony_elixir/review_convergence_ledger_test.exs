@@ -118,6 +118,72 @@ defmodule SymphonyElixir.ReviewConvergenceLedgerTest do
     assert {:ok, %{head_sha: @head_2}} = ReviewConvergenceLedger.parse_comment(valid_hold)
   end
 
+  test "public entrypoints reject non-wire input and unterminated comments" do
+    cases = [
+      {fn -> ReviewConvergenceLedger.encode(:not_an_event) end, {:error, :invalid_ledger_event}},
+      {fn -> ReviewConvergenceLedger.parse_comment(:not_a_comment) end, {:error, :malformed_ledger_event}},
+      {fn -> ReviewConvergenceLedger.history(:not_comment_bodies) end, {:error, :malformed_ledger_event}},
+      {fn ->
+         ReviewConvergenceLedger.parse_comment("<!-- symphony-review-convergence-ledger:v1\n{}")
+       end, {:error, :malformed_ledger_event}}
+    ]
+
+    Enum.each(cases, fn {operation, expected} -> assert operation.() == expected end)
+  end
+
+  test "wire decoding rejects nested duplicates and unsupported event shapes" do
+    nested_duplicate =
+      ledger_json(~s|{"schema_version":1,"event":"rework_intent","operation_id":"#{@operation_1}","round":1,"head_sha":"#{@head_1}","target_state":"In Progress","cluster_ids":[{"key":1,"key":2}]}|)
+
+    cases = [
+      {nested_duplicate, :malformed_ledger_event},
+      {ledger_block(%{"schema_version" => 2, "event" => "rework_intent"}), :unsupported_ledger_version},
+      {ledger_block(%{"schema_version" => 1, "event" => "unknown"}), :unknown_ledger_event},
+      {ledger_block(%{}), :malformed_ledger_event},
+      {ledger_block(%{
+         "schema_version" => 1,
+         "event" => "convergence_hold",
+         "hold_id" => @hold_id,
+         "head_sha" => @head_1,
+         "reason" => "unknown",
+         "cluster_ids" => []
+       }), :invalid_ledger_event},
+      {ledger_block(%{
+         "schema_version" => 1,
+         "event" => "rework_intent",
+         "operation_id" => @operation_1,
+         "round" => 1,
+         "head_sha" => @head_1,
+         "target_state" => "In Progress",
+         "cluster_ids" => %{}
+       }), :invalid_ledger_event}
+    ]
+
+    Enum.each(cases, fn {comment, expected_error} ->
+      assert ReviewConvergenceLedger.parse_comment(comment) == {:error, expected_error}
+    end)
+  end
+
+  test "event encoding rejects unsupported maps and invalid hold fields" do
+    hold = %{
+      kind: :convergence_hold,
+      hold_id: @hold_id,
+      head_sha: @head_1,
+      reason: :repeated_cluster,
+      cluster_ids: []
+    }
+
+    cases = [
+      {%{hold | reason: :unknown}, :invalid_ledger_event},
+      {%{hold | hold_id: "invalid"}, :invalid_hold_id},
+      {%{kind: :unknown}, :invalid_ledger_event}
+    ]
+
+    Enum.each(cases, fn {event, expected_error} ->
+      assert ReviewConvergenceLedger.encode(event) == {:error, expected_error}
+    end)
+  end
+
   test "history restores completed rounds, the last exact-head manifest, holds, and pending transitions" do
     intent_1 = event(:rework_intent, @operation_1, 1, @head_1, [@cluster_a])
     completed_1 = event(:rework_completed, @operation_1, 1, @head_1, [@cluster_a])
@@ -159,6 +225,37 @@ defmodule SymphonyElixir.ReviewConvergenceLedgerTest do
              ReviewConvergenceLedger.history([encoded_comment(intent), encoded_comment(other_intent)])
   end
 
+  test "history treats identical events idempotently and rejects contradictory operation reuse" do
+    intent = event(:rework_intent, @operation_1, 1, @head_1, [@cluster_a])
+    identical = encoded_comment(intent)
+
+    assert {:ok, %{pending_transitions: %{@operation_1 => ^intent}}} =
+             ReviewConvergenceLedger.history([identical, identical])
+
+    contradiction = event(:rework_intent, @operation_1, 1, @head_2, [@cluster_a])
+
+    assert {:error, :contradictory_operation} =
+             ReviewConvergenceLedger.history([
+               encoded_comment(intent),
+               encoded_comment(contradiction)
+             ])
+  end
+
+  test "history unions completed cluster manifests that share one head" do
+    intent_1 = event(:rework_intent, @operation_1, 1, @head_1, [@cluster_a])
+    completed_1 = %{intent_1 | kind: :rework_completed}
+    intent_2 = event(:rework_intent, @operation_2, 2, @head_1, [@cluster_b])
+    completed_2 = %{intent_2 | kind: :rework_completed}
+
+    comments =
+      Enum.map([intent_1, completed_1, intent_2, completed_2], &encoded_comment/1)
+
+    assert {:ok, %{completed_cluster_ids_by_head: completed_by_head}} =
+             ReviewConvergenceLedger.history(comments)
+
+    assert completed_by_head == %{@head_1 => MapSet.new([@cluster_a, @cluster_b])}
+  end
+
   defp event(kind, operation_id, round, head_sha, cluster_ids) do
     %{
       kind: kind,
@@ -177,5 +274,9 @@ defmodule SymphonyElixir.ReviewConvergenceLedgerTest do
 
   defp ledger_block(payload) do
     "<!-- symphony-review-convergence-ledger:v1\n#{Jason.encode!(payload)}\n-->"
+  end
+
+  defp ledger_json(json) do
+    "<!-- symphony-review-convergence-ledger:v1\n#{json}\n-->"
   end
 end
